@@ -1,3 +1,4 @@
 .env
 .vscode/
-**/__pycache__/UlraDomain/*jsonl
+**/__pycache__/
+UlraDomain/*jsonl
