@@ -53,7 +53,7 @@ async def embedding_func(texts):
     return np.array(embeddings)
 
 
-async def initialize_rag(working_dir, vector_storage, debug=False):
+async def initialize_rag(working_dir, vector_storage="NanoVectorDBStorage", debug=False):
     if debug:
         os.environ["LITELLM_LOG"] = "DEBUG"
         litellm._turn_on_debug()

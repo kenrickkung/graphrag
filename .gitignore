@@ -1,4 +1,8 @@
 .env
+.DS_Store
 .vscode/
 **/__pycache__/
-UlraDomain/*jsonl
+UltraDomain/
+storage/
+results/
+examples/

@@ -81,7 +81,7 @@ def test_with_sample_data(rag: LightRAG):
 
             AI is also transforming clinical trial design and execution. Algorithms can identify optimal patient populations, predict enrollment rates, design adaptive trial protocols, and monitor safety signals in real-time. Digital biomarkers derived from wearable devices and smartphone sensors provide continuous monitoring capabilities that can detect treatment effects more sensitively than traditional clinical endpoints.
 
-            Collaborative AI platforms are emerging that allow pharmaceutical companies, academic institutions, and research organizations to share data and computational resources while maintaining proprietary information security. These platforms accelerate discovery by providing access to larger datasets and more sophisticated AI models than any single organization could develop independently."""
+            Collaborative AI platforms are emerging that allow pharmaceutical companies, academic institutions, and research organizations to share data and computational resources while maintaining proprietary information security. These platforms accelerate discovery by providing access to larger datasets and more sophisticated AI models than any single organization could develop independently.""",
         ])
     
         # Query with different approaches

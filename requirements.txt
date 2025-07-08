@@ -1,1 +1,6 @@
+pipmaster
+ragatouille
+litellm
+dotenv
+psutil
 

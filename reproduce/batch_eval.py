@@ -1,19 +1,10 @@
 import re
 import json
-import os
 from litellm import completion
 from dotenv import load_dotenv
 from tqdm import tqdm
 
 MODEL = "gpt-4.1"
-
-load_dotenv()
-
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-if not LLM_API_KEY:
-    raise ValueError("Please set LLM_API_KEY in your .env file or environment")
-
-os.environ["LLM_API_KEY"] = LLM_API_KEY
 
 
 def batch_eval(query_file, result1_file, result2_file, output_file_path):
@@ -36,7 +27,6 @@ def batch_eval(query_file, result1_file, result2_file, output_file_path):
     results = []
     
     for i, (query, answer1, answer2) in tqdm(enumerate(zip(queries, answers1, answers2))):
-        print(f"Processing evaluation {i+1}/{len(queries)}...")
         
         sys_prompt = """
         ---Role---
@@ -129,10 +119,11 @@ def batch_eval(query_file, result1_file, result2_file, output_file_path):
     return results
 
 if __name__ == "__main__":
+    load_dotenv()
     cls = "agriculture"
     query_file = f"UltraDomain/{cls}_questions.txt"
-    result1_file = f"{cls}_result_simplerag.json" 
-    result2_file = f"{cls}_result.json"
-    output_file = f"{cls}_evaluation_results.json"
+    result1_file = f"results/colbert_{cls}_result.json" 
+    result2_file = f"results/{cls}_result.json"
+    output_file = f"results/{cls}_evaluation_colbert_lightrag.json"
     
     batch_eval(query_file, result1_file, result2_file, output_file)

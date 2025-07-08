@@ -221,11 +221,7 @@ class ColbertVectorDBStorage(BaseVectorStorage):
 
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
         """Get document by ID (requires search since RAGatouille doesn't have direct ID lookup)"""
-        try:
-            # Since RAGatouille doesn't have direct ID lookup, we need to search
-            # This is not efficient but necessary given ColBERT's architecture
-            client = await self._get_client()
-            
+        try:            
             # We can't directly get by ID, so this is a limitation
             # One approach is to search with a unique term from the document
             # But without knowing the content, this is challenging
@@ -283,5 +279,5 @@ class ColbertVectorDBStorage(BaseVectorStorage):
     @property
     async def client_storage(self):
         """Get client storage (RAGatouille doesn't expose internal storage like NanoVectorDB)"""
-        logger.warning("RAGatouille doesn't expose internal storage like NanoVectorDB")
+        logger.warning("RAGatouille doesn't expose internal storage")
         return None

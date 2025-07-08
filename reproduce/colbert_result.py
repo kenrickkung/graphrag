@@ -3,6 +3,7 @@ import os
 import time
 import asyncio
 import re
+import traceback
 from dotenv import load_dotenv
 import litellm
 
@@ -46,6 +47,7 @@ async def process_query(query_text, rag_instance: LightRAG, query_param):
         result = await rag_instance.aquery(query_text, param=query_param)
         return {"query": query_text, "result": result}, None
     except Exception as e:
+        traceback.print_exc()
         return None, {"query": query_text, "error": str(e)}
 
 
@@ -84,12 +86,12 @@ def main():
     mode = "late-interaction"
 
     query_param = QueryParam(mode=mode)
-    setup_logger(f"{mode}_{cls}", level="DEBUG", log_file_path=f"colbert_{cls}/{mode}_{cls}.log")
-    rag = asyncio.run(initialize_rag(f"colbert_{cls}", "ColbertVectorDBStorage", debug=True))
+    setup_logger(f"{mode}_{cls}", level="DEBUG", log_file_path=f"storage/colbert_{cls}/{mode}_{cls}.log")
+    rag = asyncio.run(initialize_rag(f"storage/colbert_{cls}", "ColbertVectorDBStorage", debug=True))
     insert_text(rag, f"UltraDomain/{cls}_unique_contexts.json")
     queries = extract_queries(f"UltraDomain/{cls}_questions.txt")
     run_queries_and_save_to_json(
-        queries, rag, query_param, f"colbert_{cls}_result.json", f"colbert_{cls}_errors.json"
+        queries, rag, query_param, f"results/colbert_{cls}_result.json", f"results/colbert_{cls}_errors.json"
     )
 
 
