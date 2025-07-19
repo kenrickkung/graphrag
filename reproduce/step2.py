@@ -1,8 +1,9 @@
 import json
 from litellm import completion
 from transformers import GPT2Tokenizer
+from dotenv import load_dotenv
 
-MODEL = "gpt-4.1"
+MODEL = "gemini/gemini-2.5-pro"
 
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
@@ -19,8 +20,8 @@ def get_summary(context, tot_tokens=2000):
 
     return summary
 
-
-clses = ["agriculture"]
+load_dotenv()
+clses = ["small_agri"]
 for cls in clses:
     with open(f"UltraDomain/{cls}_unique_contexts.json", mode="r") as f:
         unique_contexts = json.load(f)

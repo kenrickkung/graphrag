@@ -82,7 +82,7 @@ def run_queries_and_save_to_json(
 def main():
     load_dotenv()
 
-    cls = "agriculture"
+    cls = "small_agri"
     mode = "late-interaction"
 
     query_param = QueryParam(mode=mode)

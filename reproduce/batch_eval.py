@@ -4,7 +4,7 @@ from litellm import completion
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-MODEL = "gpt-4.1"
+MODEL = "gemini/gemini-2.5-pro"
 
 
 def batch_eval(query_file, result1_file, result2_file, output_file_path):
@@ -12,7 +12,7 @@ def batch_eval(query_file, result1_file, result2_file, output_file_path):
     
     with open(query_file, "r") as f:
         data = f.read()
-    queries = re.findall(r"-   Question \d+: (.+)", data)
+    queries = re.findall(r"- Question \d+: (.+)", data)
 
     with open(result1_file, "r") as f:
         answers1 = json.load(f)
@@ -86,7 +86,6 @@ def batch_eval(query_file, result1_file, result2_file, output_file_path):
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
-                max_tokens=2000,
             )
             
             evaluation_result = {
@@ -120,10 +119,10 @@ def batch_eval(query_file, result1_file, result2_file, output_file_path):
 
 if __name__ == "__main__":
     load_dotenv()
-    cls = "agriculture"
+    cls = "small_agri"
     query_file = f"UltraDomain/{cls}_questions.txt"
-    result1_file = f"results/colbert_{cls}_result.json" 
+    result1_file = f"results/{cls}_result_simplerag.json" 
     result2_file = f"results/{cls}_result.json"
-    output_file = f"results/{cls}_evaluation_colbert_lightrag.json"
+    output_file = f"results/{cls}_evaluation_simple_lightrag.json"
     
     batch_eval(query_file, result1_file, result2_file, output_file)

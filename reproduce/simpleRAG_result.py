@@ -19,7 +19,7 @@ def extract_queries(file_path):
 
     data = data.replace("**", "")
 
-    queries = re.findall(r"-   Question \d+: (.+)", data)
+    queries = re.findall(r"- Question \d+: (.+)", data)
 
     return queries
 
@@ -60,10 +60,7 @@ def run_queries_and_save_to_json(
 if __name__ == "__main__":
     load_dotenv()
 
-    LLM_API_KEY = os.getenv("LLM_API_KEY")
-    if LLM_API_KEY:
-        os.environ["LLM_API_KEY"] = LLM_API_KEY
-    cls = "agriculture"
+    cls = "small_agri"
     mode = "hybrid"
     WORKING_DIR = f"{cls}"
 

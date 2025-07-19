@@ -2,7 +2,7 @@ import os
 import json
 import time
 import asyncio
-
+from dotenv import load_dotenv
 from utils import initialize_rag
 
 def insert_text(rag, file_path):
@@ -23,16 +23,14 @@ def insert_text(rag, file_path):
         print("Insertion failed after exceeding the maximum number of retries")
 
 
-cls = "agriculture"
-WORKING_DIR = f"storage/{cls}"
-
-if not os.path.exists(WORKING_DIR):
-    os.mkdir(WORKING_DIR)
-
-
-
 def main():
     # Initialize RAG instance
+    load_dotenv()
+    cls = "small_agri"
+    WORKING_DIR = f"storage/{cls}"
+
+    if not os.path.exists(WORKING_DIR):
+        os.mkdir(WORKING_DIR)
     rag = asyncio.run(initialize_rag(WORKING_DIR))
     insert_text(rag, f"UltraDomain/{cls}_unique_contexts.json")
 

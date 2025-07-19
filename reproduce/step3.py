@@ -14,7 +14,7 @@ def extract_queries(file_path):
 
     data = data.replace("**", "")
 
-    queries = re.findall(r"-   Question \d+: (.+)", data)
+    queries = re.findall(r"- Question \d+: (.+)", data)
 
     return queries
 
@@ -56,7 +56,7 @@ def run_queries_and_save_to_json(
 
 
 if __name__ == "__main__":
-    cls = "agriculture"
+    cls = "small_agri"
     mode = "hybrid"
     WORKING_DIR = f"storage/{cls}"
 
