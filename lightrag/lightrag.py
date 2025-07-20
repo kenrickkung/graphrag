@@ -22,8 +22,15 @@ from typing import (
     Dict,
 )
 from lightrag.constants import (
-    DEFAULT_MAX_TOKEN_SUMMARY,
+    DEFAULT_MAX_GLEANING,
     DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
+    DEFAULT_TOP_K,
+    DEFAULT_CHUNK_TOP_K,
+    DEFAULT_MAX_ENTITY_TOKENS,
+    DEFAULT_MAX_RELATION_TOKENS,
+    DEFAULT_MAX_TOTAL_TOKENS,
+    DEFAULT_COSINE_THRESHOLD,
+    DEFAULT_RELATED_CHUNK_NUMBER,
 )
 from lightrag.utils import get_env_value
 
@@ -50,7 +57,7 @@ from .base import (
     StoragesStatus,
     DeletionResult,
 )
-from .namespace import NameSpace, make_namespace
+from .namespace import NameSpace
 from .operate import (
     chunking_by_token_size,
     extract_entities,
@@ -96,9 +103,7 @@ class LightRAG:
     # Directory
     # ---
 
-    working_dir: str = field(
-        default=f"./lightrag_cache_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}"
-    )
+    working_dir: str = field(default="./rag_storage")
     """Directory where cache and temporary files are stored."""
 
     # Storage
@@ -116,20 +121,60 @@ class LightRAG:
     doc_status_storage: str = field(default="JsonDocStatusStorage")
     """Storage type for tracking document processing statuses."""
 
+    # Workspace
+    # ---
+
+    workspace: str = field(default_factory=lambda: os.getenv("WORKSPACE", ""))
+    """Workspace for data isolation. Defaults to empty string if WORKSPACE environment variable is not set."""
+
     # Logging (Deprecated, use setup_logger in utils.py instead)
     # ---
     log_level: int | None = field(default=None)
     log_file_path: str | None = field(default=None)
 
+    # Query parameters
+    # ---
+
+    top_k: int = field(default=get_env_value("TOP_K", DEFAULT_TOP_K, int))
+    """Number of entities/relations to retrieve for each query."""
+
+    chunk_top_k: int = field(
+        default=get_env_value("CHUNK_TOP_K", DEFAULT_CHUNK_TOP_K, int)
+    )
+    """Maximum number of chunks in context."""
+
+    max_entity_tokens: int = field(
+        default=get_env_value("MAX_ENTITY_TOKENS", DEFAULT_MAX_ENTITY_TOKENS, int)
+    )
+    """Maximum number of tokens for entity in context."""
+
+    max_relation_tokens: int = field(
+        default=get_env_value("MAX_RELATION_TOKENS", DEFAULT_MAX_RELATION_TOKENS, int)
+    )
+    """Maximum number of tokens for relation in context."""
+
+    max_total_tokens: int = field(
+        default=get_env_value("MAX_TOTAL_TOKENS", DEFAULT_MAX_TOTAL_TOKENS, int)
+    )
+    """Maximum total tokens in context (including system prompt, entities, relations and chunks)."""
+
+    cosine_threshold: int = field(
+        default=get_env_value("COSINE_THRESHOLD", DEFAULT_COSINE_THRESHOLD, int)
+    )
+    """Cosine threshold of vector DB retrieval for entities, relations and chunks."""
+
+    related_chunk_number: int = field(
+        default=get_env_value("RELATED_CHUNK_NUMBER", DEFAULT_RELATED_CHUNK_NUMBER, int)
+    )
+    """Number of related chunks to grab from single entity or relation."""
+
     # Entity extraction
     # ---
 
-    entity_extract_max_gleaning: int = field(default=1)
-    """Maximum number of entity extraction attempts for ambiguous content."""
-
-    summary_to_max_tokens: int = field(
-        default=get_env_value("MAX_TOKEN_SUMMARY", DEFAULT_MAX_TOKEN_SUMMARY, int)
+    entity_extract_max_gleaning: int = field(
+        default=get_env_value("MAX_GLEANING", DEFAULT_MAX_GLEANING, int)
     )
+    """Maximum number of entity extraction attempts for ambiguous content."""
 
     force_llm_summary_on_merge: int = field(
         default=get_env_value(
@@ -194,11 +239,11 @@ class LightRAG:
     embedding_func: EmbeddingFunc | None = field(default=None)
     """Function for computing text embeddings. Must be set before use."""
 
-    embedding_batch_num: int = field(default=int(os.getenv("EMBEDDING_BATCH_NUM", 32)))
+    embedding_batch_num: int = field(default=int(os.getenv("EMBEDDING_BATCH_NUM", 10)))
     """Batch size for embedding computations."""
 
     embedding_func_max_async: int = field(
-        default=int(os.getenv("EMBEDDING_FUNC_MAX_ASYNC", 16))
+        default=int(os.getenv("EMBEDDING_FUNC_MAX_ASYNC", 8))
     )
     """Maximum number of concurrent embedding function calls."""
 
@@ -224,7 +269,7 @@ class LightRAG:
     llm_model_name: str = field(default="gpt-4o-mini")
     """Name of the LLM model used for generating responses."""
 
-    llm_model_max_token_size: int = field(default=int(os.getenv("MAX_TOKENS", 32768)))
+    llm_model_max_token_size: int = field(default=int(os.getenv("MAX_TOKENS", 32000)))
     """Maximum number of tokens allowed per LLM response."""
 
     llm_model_max_async: int = field(default=int(os.getenv("MAX_ASYNC", 4)))
@@ -233,15 +278,17 @@ class LightRAG:
     llm_model_kwargs: dict[str, Any] = field(default_factory=dict)
     """Additional keyword arguments passed to the LLM model function."""
 
+    # Rerank Configuration
+    # ---
+
+    rerank_model_func: Callable[..., object] | None = field(default=None)
+    """Function for reranking retrieved documents. All rerank configurations (model name, API keys, top_k, etc.) should be included in this function. Optional."""
+
     # Storage
     # ---
 
     vector_db_storage_cls_kwargs: dict[str, Any] = field(default_factory=dict)
     """Additional parameters for vector database storage."""
-
-    # TODO：deprecated, remove in the future, use WORKSPACE instead
-    namespace_prefix: str = field(default="")
-    """Prefix for namespacing stored data across different environments."""
 
     enable_llm_cache: bool = field(default=True)
     """Enables caching for LLM responses to avoid redundant computations."""
@@ -254,6 +301,9 @@ class LightRAG:
 
     max_parallel_insert: int = field(default=int(os.getenv("MAX_PARALLEL_INSERT", 2)))
     """Maximum number of parallel insert operations."""
+
+    max_graph_nodes: int = field(default=get_env_value("MAX_GRAPH_NODES", 1000, int))
+    """Maximum number of graph nodes to return in knowledge graph queries."""
 
     addon_params: dict[str, Any] = field(
         default_factory=lambda: {
@@ -346,6 +396,7 @@ class LightRAG:
 
         # Fix global_config now
         global_config = asdict(self)
+
         _print_config = ",\n  ".join([f"{k} = {v}" for k, v in global_config.items()])
         logger.debug(f"LightRAG init with param:\n  {_print_config}\n")
 
@@ -378,61 +429,53 @@ class LightRAG:
         self.doc_status_storage_cls = self._get_storage_class(self.doc_status_storage)
 
         self.llm_response_cache: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
-            namespace=make_namespace(
-                self.namespace_prefix, NameSpace.KV_STORE_LLM_RESPONSE_CACHE
-            ),
-            global_config=asdict(
-                self
-            ),  # Add global_config to ensure cache works properly
+            namespace=NameSpace.KV_STORE_LLM_RESPONSE_CACHE,
+            workspace=self.workspace,
+            global_config=global_config,
             embedding_func=self.embedding_func,
         )
 
         self.full_docs: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
-            namespace=make_namespace(
-                self.namespace_prefix, NameSpace.KV_STORE_FULL_DOCS
-            ),
+            namespace=NameSpace.KV_STORE_FULL_DOCS,
+            workspace=self.workspace,
             embedding_func=self.embedding_func,
         )
 
-        # TODO: deprecating, text_chunks is redundant with chunks_vdb
         self.text_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
-            namespace=make_namespace(
-                self.namespace_prefix, NameSpace.KV_STORE_TEXT_CHUNKS
-            ),
+            namespace=NameSpace.KV_STORE_TEXT_CHUNKS,
+            workspace=self.workspace,
             embedding_func=self.embedding_func,
         )
+
         self.chunk_entity_relation_graph: BaseGraphStorage = self.graph_storage_cls(  # type: ignore
-            namespace=make_namespace(
-                self.namespace_prefix, NameSpace.GRAPH_STORE_CHUNK_ENTITY_RELATION
-            ),
+            namespace=NameSpace.GRAPH_STORE_CHUNK_ENTITY_RELATION,
+            workspace=self.workspace,
             embedding_func=self.embedding_func,
         )
 
         self.entities_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
-            namespace=make_namespace(
-                self.namespace_prefix, NameSpace.VECTOR_STORE_ENTITIES
-            ),
+            namespace=NameSpace.VECTOR_STORE_ENTITIES,
+            workspace=self.workspace,
             embedding_func=self.embedding_func,
             meta_fields={"entity_name", "source_id", "content", "file_path"},
         )
         self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
-            namespace=make_namespace(
-                self.namespace_prefix, NameSpace.VECTOR_STORE_RELATIONSHIPS
-            ),
+            namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
+            workspace=self.workspace,
             embedding_func=self.embedding_func,
             meta_fields={"src_id", "tgt_id", "source_id", "content", "file_path"},
         )
         self.chunks_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
-            namespace=make_namespace(
-                self.namespace_prefix, NameSpace.VECTOR_STORE_CHUNKS
-            ),
+            namespace=NameSpace.VECTOR_STORE_CHUNKS,
+            workspace=self.workspace,
             embedding_func=self.embedding_func,
             meta_fields={"full_doc_id", "content", "file_path"},
         )
 
         # Initialize document status storage
         self.doc_status: DocStatusStorage = self.doc_status_storage_cls(
-            namespace=make_namespace(self.namespace_prefix, NameSpace.DOC_STATUS),
+            namespace=NameSpace.DOC_STATUS,
+            workspace=self.workspace,
             global_config=global_config,
             embedding_func=None,
         )
@@ -447,6 +490,14 @@ class LightRAG:
                 **self.llm_model_kwargs,
             )
         )
+
+        # Init Rerank
+        if self.rerank_model_func:
+            logger.info("Rerank model initialized for improved retrieval quality")
+        else:
+            logger.warning(
+                "Rerank is enabled but no rerank_model_func provided. Reranking will be skipped."
+            )
 
         self._storages_status = StoragesStatus.CREATED
 
@@ -530,18 +581,24 @@ class LightRAG:
         self,
         node_label: str,
         max_depth: int = 3,
-        max_nodes: int = 1000,
+        max_nodes: int = None,
     ) -> KnowledgeGraph:
         """Get knowledge graph for a given label
 
         Args:
             node_label (str): Label to get knowledge graph for
             max_depth (int): Maximum depth of graph
-            max_nodes (int, optional): Maximum number of nodes to return. Defaults to 1000.
+            max_nodes (int, optional): Maximum number of nodes to return. Defaults to self.max_graph_nodes.
 
         Returns:
             KnowledgeGraph: Knowledge graph containing nodes and edges
         """
+        # Use self.max_graph_nodes as default if max_nodes is None
+        if max_nodes is None:
+            max_nodes = self.max_graph_nodes
+        else:
+            # Limit max_nodes to not exceed self.max_graph_nodes
+            max_nodes = min(max_nodes, self.max_graph_nodes)
 
         return await self.chunk_entity_relation_graph.get_knowledge_graph(
             node_label, max_depth, max_nodes
@@ -895,9 +952,15 @@ class LightRAG:
                 # Get first document's file path and total count for job name
                 first_doc_id, first_doc = next(iter(to_process_docs.items()))
                 first_doc_path = first_doc.file_path
-                path_prefix = first_doc_path[:20] + (
-                    "..." if len(first_doc_path) > 20 else ""
-                )
+
+                # Handle cases where first_doc_path is None
+                if first_doc_path:
+                    path_prefix = first_doc_path[:20] + (
+                        "..." if len(first_doc_path) > 20 else ""
+                    )
+                else:
+                    path_prefix = "unknown_source"
+
                 total_files = len(to_process_docs)
                 job_name = f"{path_prefix}[{total_files} files]"
                 pipeline_status["job_name"] = job_name
@@ -949,6 +1012,7 @@ class LightRAG:
                                     **dp,
                                     "full_doc_id": doc_id,
                                     "file_path": file_path,  # Add file path to each chunk
+                                    "llm_cache_list": [],  # Initialize empty LLM cache list for each chunk
                                 }
                                 for dp in self.chunking_func(
                                     self.tokenizer,
@@ -960,14 +1024,20 @@ class LightRAG:
                                 )
                             }
 
-                            # Process document (text chunks and full docs) in parallel
-                            # Create tasks with references for potential cancellation
+                            if not chunks:
+                                logger.warning("No document chunks to process")
+
+                            # Process document in two stages
+                            # Stage 1: Process text chunks and docs (parallel execution)
                             doc_status_task = asyncio.create_task(
                                 self.doc_status.upsert(
                                     {
                                         doc_id: {
                                             "status": DocStatus.PROCESSING,
                                             "chunks_count": len(chunks),
+                                            "chunks_list": list(
+                                                chunks.keys()
+                                            ),  # Save chunks list
                                             "content": status_doc.content,
                                             "content_summary": status_doc.content_summary,
                                             "content_length": status_doc.content_length,
@@ -983,11 +1053,6 @@ class LightRAG:
                             chunks_vdb_task = asyncio.create_task(
                                 self.chunks_vdb.upsert(chunks)
                             )
-                            entity_relation_task = asyncio.create_task(
-                                self._process_entity_relation_graph(
-                                    chunks, pipeline_status, pipeline_status_lock
-                                )
-                            )
                             full_docs_task = asyncio.create_task(
                                 self.full_docs.upsert(
                                     {doc_id: {"content": status_doc.content}}
@@ -996,14 +1061,26 @@ class LightRAG:
                             text_chunks_task = asyncio.create_task(
                                 self.text_chunks.upsert(chunks)
                             )
-                            tasks = [
+
+                            # First stage tasks (parallel execution)
+                            first_stage_tasks = [
                                 doc_status_task,
                                 chunks_vdb_task,
-                                entity_relation_task,
                                 full_docs_task,
                                 text_chunks_task,
                             ]
-                            await asyncio.gather(*tasks)
+                            entity_relation_task = None
+
+                            # Execute first stage tasks
+                            await asyncio.gather(*first_stage_tasks)
+
+                            # Stage 2: Process entity relation graph (after text_chunks are saved)
+                            entity_relation_task = asyncio.create_task(
+                                self._process_entity_relation_graph(
+                                    chunks, pipeline_status, pipeline_status_lock
+                                )
+                            )
+                            await entity_relation_task
                             file_extraction_stage_ok = True
 
                         except Exception as e:
@@ -1018,14 +1095,14 @@ class LightRAG:
                                 )
                                 pipeline_status["history_messages"].append(error_msg)
 
-                                # Cancel other tasks as they are no longer meaningful
-                                for task in [
-                                    chunks_vdb_task,
-                                    entity_relation_task,
-                                    full_docs_task,
-                                    text_chunks_task,
-                                ]:
-                                    if not task.done():
+                                # Cancel tasks that are not yet completed
+                                all_tasks = first_stage_tasks + (
+                                    [entity_relation_task]
+                                    if entity_relation_task
+                                    else []
+                                )
+                                for task in all_tasks:
+                                    if task and not task.done():
                                         task.cancel()
 
                             # Persistent llm cache
@@ -1050,83 +1127,89 @@ class LightRAG:
                                 }
                             )
 
-                    # Semphore released, concurrency controlled by graph_db_lock in merge_nodes_and_edges instead
-
-                    if file_extraction_stage_ok:
-                        try:
-                            # Get chunk_results from entity_relation_task
-                            chunk_results = await entity_relation_task
-                            await merge_nodes_and_edges(
-                                chunk_results=chunk_results,  # result collected from entity_relation_task
-                                knowledge_graph_inst=self.chunk_entity_relation_graph,
-                                entity_vdb=self.entities_vdb,
-                                relationships_vdb=self.relationships_vdb,
-                                global_config=asdict(self),
-                                pipeline_status=pipeline_status,
-                                pipeline_status_lock=pipeline_status_lock,
-                                llm_response_cache=self.llm_response_cache,
-                                current_file_number=current_file_number,
-                                total_files=total_files,
-                                file_path=file_path,
-                            )
-
-                            await self.doc_status.upsert(
-                                {
-                                    doc_id: {
-                                        "status": DocStatus.PROCESSED,
-                                        "chunks_count": len(chunks),
-                                        "content": status_doc.content,
-                                        "content_summary": status_doc.content_summary,
-                                        "content_length": status_doc.content_length,
-                                        "created_at": status_doc.created_at,
-                                        "updated_at": datetime.now(
-                                            timezone.utc
-                                        ).isoformat(),
-                                        "file_path": file_path,
-                                    }
-                                }
-                            )
-
-                            # Call _insert_done after processing each file
-                            await self._insert_done()
-
-                            async with pipeline_status_lock:
-                                log_message = f"Completed processing file {current_file_number}/{total_files}: {file_path}"
-                                logger.info(log_message)
-                                pipeline_status["latest_message"] = log_message
-                                pipeline_status["history_messages"].append(log_message)
-
-                        except Exception as e:
-                            # Log error and update pipeline status
-                            logger.error(traceback.format_exc())
-                            error_msg = f"Merging stage failed in document {current_file_number}/{total_files}: {file_path}"
-                            logger.error(error_msg)
-                            async with pipeline_status_lock:
-                                pipeline_status["latest_message"] = error_msg
-                                pipeline_status["history_messages"].append(
-                                    traceback.format_exc()
+                        # Concurrency is controlled by graph db lock for individual entities and relationships
+                        if file_extraction_stage_ok:
+                            try:
+                                # Get chunk_results from entity_relation_task
+                                chunk_results = await entity_relation_task
+                                await merge_nodes_and_edges(
+                                    chunk_results=chunk_results,  # result collected from entity_relation_task
+                                    knowledge_graph_inst=self.chunk_entity_relation_graph,
+                                    entity_vdb=self.entities_vdb,
+                                    relationships_vdb=self.relationships_vdb,
+                                    global_config=asdict(self),
+                                    pipeline_status=pipeline_status,
+                                    pipeline_status_lock=pipeline_status_lock,
+                                    llm_response_cache=self.llm_response_cache,
+                                    current_file_number=current_file_number,
+                                    total_files=total_files,
+                                    file_path=file_path,
                                 )
-                                pipeline_status["history_messages"].append(error_msg)
 
-                            # Persistent llm cache
-                            if self.llm_response_cache:
-                                await self.llm_response_cache.index_done_callback()
-
-                            # Update document status to failed
-                            await self.doc_status.upsert(
-                                {
-                                    doc_id: {
-                                        "status": DocStatus.FAILED,
-                                        "error": str(e),
-                                        "content": status_doc.content,
-                                        "content_summary": status_doc.content_summary,
-                                        "content_length": status_doc.content_length,
-                                        "created_at": status_doc.created_at,
-                                        "updated_at": datetime.now().isoformat(),
-                                        "file_path": file_path,
+                                await self.doc_status.upsert(
+                                    {
+                                        doc_id: {
+                                            "status": DocStatus.PROCESSED,
+                                            "chunks_count": len(chunks),
+                                            "chunks_list": list(
+                                                chunks.keys()
+                                            ),  # 保留 chunks_list
+                                            "content": status_doc.content,
+                                            "content_summary": status_doc.content_summary,
+                                            "content_length": status_doc.content_length,
+                                            "created_at": status_doc.created_at,
+                                            "updated_at": datetime.now(
+                                                timezone.utc
+                                            ).isoformat(),
+                                            "file_path": file_path,
+                                        }
                                     }
-                                }
-                            )
+                                )
+
+                                # Call _insert_done after processing each file
+                                await self._insert_done()
+
+                                async with pipeline_status_lock:
+                                    log_message = f"Completed processing file {current_file_number}/{total_files}: {file_path}"
+                                    logger.info(log_message)
+                                    pipeline_status["latest_message"] = log_message
+                                    pipeline_status["history_messages"].append(
+                                        log_message
+                                    )
+
+                            except Exception as e:
+                                # Log error and update pipeline status
+                                logger.error(traceback.format_exc())
+                                error_msg = f"Merging stage failed in document {current_file_number}/{total_files}: {file_path}"
+                                logger.error(error_msg)
+                                async with pipeline_status_lock:
+                                    pipeline_status["latest_message"] = error_msg
+                                    pipeline_status["history_messages"].append(
+                                        traceback.format_exc()
+                                    )
+                                    pipeline_status["history_messages"].append(
+                                        error_msg
+                                    )
+
+                                # Persistent llm cache
+                                if self.llm_response_cache:
+                                    await self.llm_response_cache.index_done_callback()
+
+                                # Update document status to failed
+                                await self.doc_status.upsert(
+                                    {
+                                        doc_id: {
+                                            "status": DocStatus.FAILED,
+                                            "error": str(e),
+                                            "content": status_doc.content,
+                                            "content_summary": status_doc.content_summary,
+                                            "content_length": status_doc.content_length,
+                                            "created_at": status_doc.created_at,
+                                            "updated_at": datetime.now().isoformat(),
+                                            "file_path": file_path,
+                                        }
+                                    }
+                                )
 
                 # Create processing tasks for all documents
                 doc_tasks = []
@@ -1193,6 +1276,7 @@ class LightRAG:
                 pipeline_status=pipeline_status,
                 pipeline_status_lock=pipeline_status_lock,
                 llm_response_cache=self.llm_response_cache,
+                text_chunks_storage=self.text_chunks,
             )
             return chunk_results
         except Exception as e:
@@ -1455,14 +1539,7 @@ class LightRAG:
         # Save original query for vector search
         param.original_query = query
 
-        if param.mode == "late-interaction":
-            if self.vector_storage != "ColbertVectorDBStorage":
-                raise ValueError(
-                    f"The 'late-interaction' query mode is only supported with 'ColbertVectorDBStorage' "
-                    f"as the vector_storage. Current vector_storage: '{self.vector_storage}'"
-                )
-
-        if param.mode in ["local", "global", "hybrid", "mix", "late-interaction"]:
+        if param.mode in ["local", "global", "hybrid", "mix"]:
             response = await kg_query(
                 query.strip(),
                 self.chunk_entity_relation_graph,
@@ -1730,28 +1807,10 @@ class LightRAG:
                     file_path="",
                 )
 
-            # 2. Get all chunks related to this document
-            try:
-                all_chunks = await self.text_chunks.get_all()
-                related_chunks = {
-                    chunk_id: chunk_data
-                    for chunk_id, chunk_data in all_chunks.items()
-                    if isinstance(chunk_data, dict)
-                    and chunk_data.get("full_doc_id") == doc_id
-                }
+            # 2. Get chunk IDs from document status
+            chunk_ids = set(doc_status_data.get("chunks_list", []))
 
-                # Update pipeline status after getting chunks count
-                async with pipeline_status_lock:
-                    log_message = f"Retrieved {len(related_chunks)} of {len(all_chunks)} related chunks"
-                    logger.info(log_message)
-                    pipeline_status["latest_message"] = log_message
-                    pipeline_status["history_messages"].append(log_message)
-
-            except Exception as e:
-                logger.error(f"Failed to retrieve chunks for document {doc_id}: {e}")
-                raise Exception(f"Failed to retrieve document chunks: {e}") from e
-
-            if not related_chunks:
+            if not chunk_ids:
                 logger.warning(f"No chunks found for document {doc_id}")
                 # Mark that deletion operations have started
                 deletion_operations_started = True
@@ -1782,7 +1841,6 @@ class LightRAG:
                     file_path=file_path,
                 )
 
-            chunk_ids = set(related_chunks.keys())
             # Mark that deletion operations have started
             deletion_operations_started = True
 
@@ -1806,25 +1864,11 @@ class LightRAG:
                         )
                     )
 
-                    # Update pipeline status after getting affected_nodes
-                    async with pipeline_status_lock:
-                        log_message = f"Found {len(affected_nodes)} affected entities"
-                        logger.info(log_message)
-                        pipeline_status["latest_message"] = log_message
-                        pipeline_status["history_messages"].append(log_message)
-
                     affected_edges = (
                         await self.chunk_entity_relation_graph.get_edges_by_chunk_ids(
                             list(chunk_ids)
                         )
                     )
-
-                    # Update pipeline status after getting affected_edges
-                    async with pipeline_status_lock:
-                        log_message = f"Found {len(affected_edges)} affected relations"
-                        logger.info(log_message)
-                        pipeline_status["latest_message"] = log_message
-                        pipeline_status["history_messages"].append(log_message)
 
                 except Exception as e:
                     logger.error(f"Failed to analyze affected graph elements: {e}")
@@ -1842,6 +1886,14 @@ class LightRAG:
                                 entities_to_delete.add(node_label)
                             elif remaining_sources != sources:
                                 entities_to_rebuild[node_label] = remaining_sources
+
+                    async with pipeline_status_lock:
+                        log_message = (
+                            f"Found {len(entities_to_rebuild)} affected entities"
+                        )
+                        logger.info(log_message)
+                        pipeline_status["latest_message"] = log_message
+                        pipeline_status["history_messages"].append(log_message)
 
                     # Process relationships
                     for edge_data in affected_edges:
@@ -1863,6 +1915,14 @@ class LightRAG:
                                 relationships_to_delete.add(edge_tuple)
                             elif remaining_sources != sources:
                                 relationships_to_rebuild[edge_tuple] = remaining_sources
+
+                    async with pipeline_status_lock:
+                        log_message = (
+                            f"Found {len(relationships_to_rebuild)} affected relations"
+                        )
+                        logger.info(log_message)
+                        pipeline_status["latest_message"] = log_message
+                        pipeline_status["history_messages"].append(log_message)
 
                 except Exception as e:
                     logger.error(f"Failed to process graph analysis results: {e}")
@@ -1947,16 +2007,12 @@ class LightRAG:
                             knowledge_graph_inst=self.chunk_entity_relation_graph,
                             entities_vdb=self.entities_vdb,
                             relationships_vdb=self.relationships_vdb,
-                            text_chunks=self.text_chunks,
+                            text_chunks_storage=self.text_chunks,
                             llm_response_cache=self.llm_response_cache,
                             global_config=asdict(self),
+                            pipeline_status=pipeline_status,
+                            pipeline_status_lock=pipeline_status_lock,
                         )
-
-                        async with pipeline_status_lock:
-                            log_message = f"Successfully rebuilt {len(entities_to_rebuild)} entities and {len(relationships_to_rebuild)} relations"
-                            logger.info(log_message)
-                            pipeline_status["latest_message"] = log_message
-                            pipeline_status["history_messages"].append(log_message)
 
                     except Exception as e:
                         logger.error(f"Failed to rebuild knowledge from chunks: {e}")

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import datetime
 from datetime import timezone
 from dataclasses import dataclass, field
@@ -43,9 +44,6 @@ from dotenv import load_dotenv
 # allows to use different .env file for each lightrag instance
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path=".env", override=False)
-
-# Get maximum number of graph nodes from environment variable, default is 1000
-MAX_GRAPH_NODES = int(os.getenv("MAX_GRAPH_NODES", 1000))
 
 
 class PostgreSQLDB:
@@ -107,25 +105,32 @@ class PostgreSQLDB:
         ):
             pass
 
-    async def _migrate_llm_cache_add_chunk_id(self):
-        """Add chunk_id column to LIGHTRAG_LLM_CACHE table if it doesn't exist"""
+    async def _migrate_llm_cache_add_columns(self):
+        """Add chunk_id and cache_type columns to LIGHTRAG_LLM_CACHE table if they don't exist"""
         try:
-            # Check if chunk_id column exists
-            check_column_sql = """
+            # Check if both columns exist
+            check_columns_sql = """
             SELECT column_name
             FROM information_schema.columns
             WHERE table_name = 'lightrag_llm_cache'
-            AND column_name = 'chunk_id'
+            AND column_name IN ('chunk_id', 'cache_type')
             """
 
-            column_info = await self.query(check_column_sql)
-            if not column_info:
+            existing_columns = await self.query(check_columns_sql, multirows=True)
+            existing_column_names = (
+                {col["column_name"] for col in existing_columns}
+                if existing_columns
+                else set()
+            )
+
+            # Add missing chunk_id column
+            if "chunk_id" not in existing_column_names:
                 logger.info("Adding chunk_id column to LIGHTRAG_LLM_CACHE table")
-                add_column_sql = """
+                add_chunk_id_sql = """
                 ALTER TABLE LIGHTRAG_LLM_CACHE
                 ADD COLUMN chunk_id VARCHAR(255) NULL
                 """
-                await self.execute(add_column_sql)
+                await self.execute(add_chunk_id_sql)
                 logger.info(
                     "Successfully added chunk_id column to LIGHTRAG_LLM_CACHE table"
                 )
@@ -133,16 +138,49 @@ class PostgreSQLDB:
                 logger.info(
                     "chunk_id column already exists in LIGHTRAG_LLM_CACHE table"
                 )
+
+            # Add missing cache_type column
+            if "cache_type" not in existing_column_names:
+                logger.info("Adding cache_type column to LIGHTRAG_LLM_CACHE table")
+                add_cache_type_sql = """
+                ALTER TABLE LIGHTRAG_LLM_CACHE
+                ADD COLUMN cache_type VARCHAR(32) NULL
+                """
+                await self.execute(add_cache_type_sql)
+                logger.info(
+                    "Successfully added cache_type column to LIGHTRAG_LLM_CACHE table"
+                )
+
+                # Migrate existing data using optimized regex pattern
+                logger.info(
+                    "Migrating existing LLM cache data to populate cache_type field (optimized)"
+                )
+                optimized_update_sql = """
+                UPDATE LIGHTRAG_LLM_CACHE
+                SET cache_type = CASE
+                    WHEN id ~ '^[^:]+:[^:]+:' THEN split_part(id, ':', 2)
+                    ELSE 'extract'
+                END
+                WHERE cache_type IS NULL
+                """
+                await self.execute(optimized_update_sql)
+                logger.info("Successfully migrated existing LLM cache data")
+            else:
+                logger.info(
+                    "cache_type column already exists in LIGHTRAG_LLM_CACHE table"
+                )
+
         except Exception as e:
-            logger.warning(f"Failed to add chunk_id column to LIGHTRAG_LLM_CACHE: {e}")
+            logger.warning(f"Failed to add columns to LIGHTRAG_LLM_CACHE: {e}")
 
     async def _migrate_timestamp_columns(self):
-        """Migrate timestamp columns in tables to timezone-aware types, assuming original data is in UTC time"""
+        """Migrate timestamp columns in tables to witimezone-free types, assuming original data is in UTC time"""
         # Tables and columns that need migration
         tables_to_migrate = {
             "LIGHTRAG_VDB_ENTITY": ["create_time", "update_time"],
             "LIGHTRAG_VDB_RELATION": ["create_time", "update_time"],
             "LIGHTRAG_DOC_CHUNKS": ["create_time", "update_time"],
+            "LIGHTRAG_DOC_STATUS": ["created_at", "updated_at"],
         }
 
         for table_name, columns in tables_to_migrate.items():
@@ -165,29 +203,359 @@ class PostgreSQLDB:
 
                     # Check column type
                     data_type = column_info.get("data_type")
-                    if data_type == "timestamp with time zone":
-                        logger.info(
-                            f"Column {table_name}.{column_name} is already timezone-aware, no migration needed"
+                    if data_type == "timestamp without time zone":
+                        logger.debug(
+                            f"Column {table_name}.{column_name} is already witimezone-free, no migration needed"
                         )
                         continue
 
                     # Execute migration, explicitly specifying UTC timezone for interpreting original data
                     logger.info(
-                        f"Migrating {table_name}.{column_name} to timezone-aware type"
+                        f"Migrating {table_name}.{column_name} from {data_type} to TIMESTAMP(0) type"
                     )
                     migration_sql = f"""
                     ALTER TABLE {table_name}
-                    ALTER COLUMN {column_name} TYPE TIMESTAMP(0) WITH TIME ZONE
-                    USING {column_name} AT TIME ZONE 'UTC'
+                    ALTER COLUMN {column_name} TYPE TIMESTAMP(0),
+                    ALTER COLUMN {column_name} SET DEFAULT CURRENT_TIMESTAMP
                     """
 
                     await self.execute(migration_sql)
                     logger.info(
-                        f"Successfully migrated {table_name}.{column_name} to timezone-aware type"
+                        f"Successfully migrated {table_name}.{column_name} to timezone-free type"
                     )
                 except Exception as e:
                     # Log error but don't interrupt the process
                     logger.warning(f"Failed to migrate {table_name}.{column_name}: {e}")
+
+    async def _migrate_doc_chunks_to_vdb_chunks(self):
+        """
+        Migrate data from LIGHTRAG_DOC_CHUNKS to LIGHTRAG_VDB_CHUNKS if specific conditions are met.
+        This migration is intended for users who are upgrading and have an older table structure
+        where LIGHTRAG_DOC_CHUNKS contained a `content_vector` column.
+
+        """
+        try:
+            # 1. Check if the new table LIGHTRAG_VDB_CHUNKS is empty
+            vdb_chunks_count_sql = "SELECT COUNT(1) as count FROM LIGHTRAG_VDB_CHUNKS"
+            vdb_chunks_count_result = await self.query(vdb_chunks_count_sql)
+            if vdb_chunks_count_result and vdb_chunks_count_result["count"] > 0:
+                logger.info(
+                    "Skipping migration: LIGHTRAG_VDB_CHUNKS already contains data."
+                )
+                return
+
+            # 2. Check if `content_vector` column exists in the old table
+            check_column_sql = """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'lightrag_doc_chunks' AND column_name = 'content_vector'
+            """
+            column_exists = await self.query(check_column_sql)
+            if not column_exists:
+                logger.info(
+                    "Skipping migration: `content_vector` not found in LIGHTRAG_DOC_CHUNKS"
+                )
+                return
+
+            # 3. Check if the old table LIGHTRAG_DOC_CHUNKS has data
+            doc_chunks_count_sql = "SELECT COUNT(1) as count FROM LIGHTRAG_DOC_CHUNKS"
+            doc_chunks_count_result = await self.query(doc_chunks_count_sql)
+            if not doc_chunks_count_result or doc_chunks_count_result["count"] == 0:
+                logger.info("Skipping migration: LIGHTRAG_DOC_CHUNKS is empty.")
+                return
+
+            # 4. Perform the migration
+            logger.info(
+                "Starting data migration from LIGHTRAG_DOC_CHUNKS to LIGHTRAG_VDB_CHUNKS..."
+            )
+            migration_sql = """
+            INSERT INTO LIGHTRAG_VDB_CHUNKS (
+                id, workspace, full_doc_id, chunk_order_index, tokens, content,
+                content_vector, file_path, create_time, update_time
+            )
+            SELECT
+                id, workspace, full_doc_id, chunk_order_index, tokens, content,
+                content_vector, file_path, create_time, update_time
+            FROM LIGHTRAG_DOC_CHUNKS
+            ON CONFLICT (workspace, id) DO NOTHING;
+            """
+            await self.execute(migration_sql)
+            logger.info("Data migration to LIGHTRAG_VDB_CHUNKS completed successfully.")
+
+        except Exception as e:
+            logger.error(f"Failed during data migration to LIGHTRAG_VDB_CHUNKS: {e}")
+            # Do not re-raise, to allow the application to start
+
+    async def _check_llm_cache_needs_migration(self):
+        """Check if LLM cache data needs migration by examining any record with old format"""
+        try:
+            # Optimized query: directly check for old format records without sorting
+            check_sql = """
+            SELECT 1 FROM LIGHTRAG_LLM_CACHE
+            WHERE id NOT LIKE '%:%'
+            LIMIT 1
+            """
+            result = await self.query(check_sql)
+
+            # If any old format record exists, migration is needed
+            return result is not None
+
+        except Exception as e:
+            logger.warning(f"Failed to check LLM cache migration status: {e}")
+            return False
+
+    async def _migrate_llm_cache_to_flattened_keys(self):
+        """Optimized version: directly execute single UPDATE migration to migrate old format cache keys to flattened format"""
+        try:
+            # Check if migration is needed
+            check_sql = """
+            SELECT COUNT(*) as count FROM LIGHTRAG_LLM_CACHE
+            WHERE id NOT LIKE '%:%'
+            """
+            result = await self.query(check_sql)
+
+            if not result or result["count"] == 0:
+                logger.info("No old format LLM cache data found, skipping migration")
+                return
+
+            old_count = result["count"]
+            logger.info(f"Found {old_count} old format cache records")
+
+            # Check potential primary key conflicts (optional but recommended)
+            conflict_check_sql = """
+            WITH new_ids AS (
+                SELECT
+                    workspace,
+                    mode,
+                    id as old_id,
+                    mode || ':' ||
+                    CASE WHEN mode = 'default' THEN 'extract' ELSE 'unknown' END || ':' ||
+                    md5(original_prompt) as new_id
+                FROM LIGHTRAG_LLM_CACHE
+                WHERE id NOT LIKE '%:%'
+            )
+            SELECT COUNT(*) as conflicts
+            FROM new_ids n1
+            JOIN LIGHTRAG_LLM_CACHE existing
+            ON existing.workspace = n1.workspace
+            AND existing.mode = n1.mode
+            AND existing.id = n1.new_id
+            WHERE existing.id LIKE '%:%'  -- Only check conflicts with existing new format records
+            """
+
+            conflict_result = await self.query(conflict_check_sql)
+            if conflict_result and conflict_result["conflicts"] > 0:
+                logger.warning(
+                    f"Found {conflict_result['conflicts']} potential ID conflicts with existing records"
+                )
+                # Can choose to continue or abort, here we choose to continue and log warning
+
+            # Execute single UPDATE migration
+            logger.info("Starting optimized LLM cache migration...")
+            migration_sql = """
+            UPDATE LIGHTRAG_LLM_CACHE
+            SET
+                id = mode || ':' ||
+                     CASE WHEN mode = 'default' THEN 'extract' ELSE 'unknown' END || ':' ||
+                     md5(original_prompt),
+                cache_type = CASE WHEN mode = 'default' THEN 'extract' ELSE 'unknown' END,
+                update_time = CURRENT_TIMESTAMP
+            WHERE id NOT LIKE '%:%'
+            """
+
+            # Execute migration
+            await self.execute(migration_sql)
+
+            # Verify migration results
+            verify_sql = """
+            SELECT COUNT(*) as remaining_old FROM LIGHTRAG_LLM_CACHE
+            WHERE id NOT LIKE '%:%'
+            """
+            verify_result = await self.query(verify_sql)
+            remaining = verify_result["remaining_old"] if verify_result else -1
+
+            if remaining == 0:
+                logger.info(
+                    f"✅ Successfully migrated {old_count} LLM cache records to flattened format"
+                )
+            else:
+                logger.warning(
+                    f"⚠️ Migration completed but {remaining} old format records remain"
+                )
+
+        except Exception as e:
+            logger.error(f"Optimized LLM cache migration failed: {e}")
+            raise
+
+    async def _migrate_doc_status_add_chunks_list(self):
+        """Add chunks_list column to LIGHTRAG_DOC_STATUS table if it doesn't exist"""
+        try:
+            # Check if chunks_list column exists
+            check_column_sql = """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'lightrag_doc_status'
+            AND column_name = 'chunks_list'
+            """
+
+            column_info = await self.query(check_column_sql)
+            if not column_info:
+                logger.info("Adding chunks_list column to LIGHTRAG_DOC_STATUS table")
+                add_column_sql = """
+                ALTER TABLE LIGHTRAG_DOC_STATUS
+                ADD COLUMN chunks_list JSONB NULL DEFAULT '[]'::jsonb
+                """
+                await self.execute(add_column_sql)
+                logger.info(
+                    "Successfully added chunks_list column to LIGHTRAG_DOC_STATUS table"
+                )
+            else:
+                logger.info(
+                    "chunks_list column already exists in LIGHTRAG_DOC_STATUS table"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to add chunks_list column to LIGHTRAG_DOC_STATUS: {e}"
+            )
+
+    async def _migrate_text_chunks_add_llm_cache_list(self):
+        """Add llm_cache_list column to LIGHTRAG_DOC_CHUNKS table if it doesn't exist"""
+        try:
+            # Check if llm_cache_list column exists
+            check_column_sql = """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'lightrag_doc_chunks'
+            AND column_name = 'llm_cache_list'
+            """
+
+            column_info = await self.query(check_column_sql)
+            if not column_info:
+                logger.info("Adding llm_cache_list column to LIGHTRAG_DOC_CHUNKS table")
+                add_column_sql = """
+                ALTER TABLE LIGHTRAG_DOC_CHUNKS
+                ADD COLUMN llm_cache_list JSONB NULL DEFAULT '[]'::jsonb
+                """
+                await self.execute(add_column_sql)
+                logger.info(
+                    "Successfully added llm_cache_list column to LIGHTRAG_DOC_CHUNKS table"
+                )
+            else:
+                logger.info(
+                    "llm_cache_list column already exists in LIGHTRAG_DOC_CHUNKS table"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to add llm_cache_list column to LIGHTRAG_DOC_CHUNKS: {e}"
+            )
+
+    async def _migrate_field_lengths(self):
+        """Migrate database field lengths: entity_name, source_id, target_id, and file_path"""
+        # Define the field changes needed
+        field_migrations = [
+            {
+                "table": "LIGHTRAG_VDB_ENTITY",
+                "column": "entity_name",
+                "old_type": "character varying(255)",
+                "new_type": "VARCHAR(512)",
+                "description": "entity_name from 255 to 512",
+            },
+            {
+                "table": "LIGHTRAG_VDB_RELATION",
+                "column": "source_id",
+                "old_type": "character varying(256)",
+                "new_type": "VARCHAR(512)",
+                "description": "source_id from 256 to 512",
+            },
+            {
+                "table": "LIGHTRAG_VDB_RELATION",
+                "column": "target_id",
+                "old_type": "character varying(256)",
+                "new_type": "VARCHAR(512)",
+                "description": "target_id from 256 to 512",
+            },
+            {
+                "table": "LIGHTRAG_DOC_CHUNKS",
+                "column": "file_path",
+                "old_type": "character varying(256)",
+                "new_type": "TEXT",
+                "description": "file_path to TEXT NULL",
+            },
+            {
+                "table": "LIGHTRAG_VDB_CHUNKS",
+                "column": "file_path",
+                "old_type": "character varying(256)",
+                "new_type": "TEXT",
+                "description": "file_path to TEXT NULL",
+            },
+        ]
+
+        for migration in field_migrations:
+            try:
+                # Check current column definition
+                check_column_sql = """
+                SELECT column_name, data_type, character_maximum_length, is_nullable
+                FROM information_schema.columns
+                WHERE table_name = $1 AND column_name = $2
+                """
+
+                column_info = await self.query(
+                    check_column_sql,
+                    {
+                        "table_name": migration["table"].lower(),
+                        "column_name": migration["column"],
+                    },
+                )
+
+                if not column_info:
+                    logger.warning(
+                        f"Column {migration['table']}.{migration['column']} does not exist, skipping migration"
+                    )
+                    continue
+
+                current_type = column_info.get("data_type", "").lower()
+                current_length = column_info.get("character_maximum_length")
+
+                # Check if migration is needed
+                needs_migration = False
+
+                if migration["column"] == "entity_name" and current_length == 255:
+                    needs_migration = True
+                elif (
+                    migration["column"] in ["source_id", "target_id"]
+                    and current_length == 256
+                ):
+                    needs_migration = True
+                elif (
+                    migration["column"] == "file_path"
+                    and current_type == "character varying"
+                ):
+                    needs_migration = True
+
+                if needs_migration:
+                    logger.info(
+                        f"Migrating {migration['table']}.{migration['column']}: {migration['description']}"
+                    )
+
+                    # Execute the migration
+                    alter_sql = f"""
+                    ALTER TABLE {migration['table']}
+                    ALTER COLUMN {migration['column']} TYPE {migration['new_type']}
+                    """
+
+                    await self.execute(alter_sql)
+                    logger.info(
+                        f"Successfully migrated {migration['table']}.{migration['column']}"
+                    )
+                else:
+                    logger.debug(
+                        f"Column {migration['table']}.{migration['column']} already has correct type, no migration needed"
+                    )
+
+            except Exception as e:
+                # Log error but don't interrupt the process
+                logger.warning(
+                    f"Failed to migrate {migration['table']}.{migration['column']}: {e}"
+                )
 
     async def check_tables(self):
         # First create all tables
@@ -226,6 +594,29 @@ class PostgreSQLDB:
                     f"PostgreSQL, Failed to create index on table {k}, Got: {e}"
                 )
 
+            # Create composite index for (workspace, id) columns in each table
+            try:
+                composite_index_name = f"idx_{k.lower()}_workspace_id"
+                check_composite_index_sql = f"""
+                SELECT 1 FROM pg_indexes
+                WHERE indexname = '{composite_index_name}'
+                AND tablename = '{k.lower()}'
+                """
+                composite_index_exists = await self.query(check_composite_index_sql)
+
+                if not composite_index_exists:
+                    create_composite_index_sql = (
+                        f"CREATE INDEX {composite_index_name} ON {k}(workspace, id)"
+                    )
+                    logger.info(
+                        f"PostgreSQL, Creating composite index {composite_index_name} on table {k}"
+                    )
+                    await self.execute(create_composite_index_sql)
+            except Exception as e:
+                logger.error(
+                    f"PostgreSQL, Failed to create composite index on table {k}, Got: {e}"
+                )
+
         # After all tables are created, attempt to migrate timestamp fields
         try:
             await self._migrate_timestamp_columns()
@@ -233,12 +624,47 @@ class PostgreSQLDB:
             logger.error(f"PostgreSQL, Failed to migrate timestamp columns: {e}")
             # Don't throw an exception, allow the initialization process to continue
 
-        # Migrate LLM cache table to add chunk_id field if needed
+        # Migrate LLM cache table to add chunk_id and cache_type columns if needed
         try:
-            await self._migrate_llm_cache_add_chunk_id()
+            await self._migrate_llm_cache_add_columns()
         except Exception as e:
-            logger.error(f"PostgreSQL, Failed to migrate LLM cache chunk_id field: {e}")
+            logger.error(f"PostgreSQL, Failed to migrate LLM cache columns: {e}")
             # Don't throw an exception, allow the initialization process to continue
+
+        # Finally, attempt to migrate old doc chunks data if needed
+        try:
+            await self._migrate_doc_chunks_to_vdb_chunks()
+        except Exception as e:
+            logger.error(f"PostgreSQL, Failed to migrate doc_chunks to vdb_chunks: {e}")
+
+        # Check and migrate LLM cache to flattened keys if needed
+        try:
+            if await self._check_llm_cache_needs_migration():
+                await self._migrate_llm_cache_to_flattened_keys()
+        except Exception as e:
+            logger.error(f"PostgreSQL, LLM cache migration failed: {e}")
+
+        # Migrate doc status to add chunks_list field if needed
+        try:
+            await self._migrate_doc_status_add_chunks_list()
+        except Exception as e:
+            logger.error(
+                f"PostgreSQL, Failed to migrate doc status chunks_list field: {e}"
+            )
+
+        # Migrate text chunks to add llm_cache_list field if needed
+        try:
+            await self._migrate_text_chunks_add_llm_cache_list()
+        except Exception as e:
+            logger.error(
+                f"PostgreSQL, Failed to migrate text chunks llm_cache_list field: {e}"
+            )
+
+        # Migrate field lengths for entity_name, source_id, target_id, and file_path
+        try:
+            await self._migrate_field_lengths()
+        except Exception as e:
+            logger.error(f"PostgreSQL, Failed to migrate field lengths: {e}")
 
     async def query(
         self,
@@ -353,7 +779,7 @@ class ClientManager:
             ),
             "workspace": os.environ.get(
                 "POSTGRES_WORKSPACE",
-                config.get("postgres", "workspace", fallback="default"),
+                config.get("postgres", "workspace", fallback=None),
             ),
             "max_connections": os.environ.get(
                 "POSTGRES_MAX_CONNECTIONS",
@@ -399,6 +825,18 @@ class PGKVStorage(BaseKVStorage):
     async def initialize(self):
         if self.db is None:
             self.db = await ClientManager.get_client()
+            # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
+            if self.db.workspace:
+                # Use PostgreSQLDB's workspace (highest priority)
+                final_workspace = self.db.workspace
+            elif hasattr(self, "workspace") and self.workspace:
+                # Use storage class's workspace (medium priority)
+                final_workspace = self.workspace
+                self.db.workspace = final_workspace
+            else:
+                # Use "default" for compatibility (lowest priority)
+                final_workspace = "default"
+                self.db.workspace = final_workspace
 
     async def finalize(self):
         if self.db is not None:
@@ -423,74 +861,139 @@ class PGKVStorage(BaseKVStorage):
         try:
             results = await self.db.query(sql, params, multirows=True)
 
+            # Special handling for LLM cache to ensure compatibility with _get_cached_extraction_results
             if is_namespace(self.namespace, NameSpace.KV_STORE_LLM_RESPONSE_CACHE):
-                result_dict = {}
+                processed_results = {}
                 for row in results:
-                    mode = row["mode"]
-                    if mode not in result_dict:
-                        result_dict[mode] = {}
-                    result_dict[mode][row["id"]] = row
-                return result_dict
-            else:
-                return {row["id"]: row for row in results}
+                    create_time = row.get("create_time", 0)
+                    update_time = row.get("update_time", 0)
+                    # Map field names and add cache_type for compatibility
+                    processed_row = {
+                        **row,
+                        "return": row.get("return_value", ""),
+                        "cache_type": row.get("original_prompt", "unknow"),
+                        "original_prompt": row.get("original_prompt", ""),
+                        "chunk_id": row.get("chunk_id"),
+                        "mode": row.get("mode", "default"),
+                        "create_time": create_time,
+                        "update_time": create_time if update_time == 0 else update_time,
+                    }
+                    processed_results[row["id"]] = processed_row
+                return processed_results
+
+            # For text_chunks namespace, parse llm_cache_list JSON string back to list
+            if is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
+                processed_results = {}
+                for row in results:
+                    llm_cache_list = row.get("llm_cache_list", [])
+                    if isinstance(llm_cache_list, str):
+                        try:
+                            llm_cache_list = json.loads(llm_cache_list)
+                        except json.JSONDecodeError:
+                            llm_cache_list = []
+                    row["llm_cache_list"] = llm_cache_list
+                    create_time = row.get("create_time", 0)
+                    update_time = row.get("update_time", 0)
+                    row["create_time"] = create_time
+                    row["update_time"] = (
+                        create_time if update_time == 0 else update_time
+                    )
+                    processed_results[row["id"]] = row
+                return processed_results
+
+            # For other namespaces, return as-is
+            return {row["id"]: row for row in results}
         except Exception as e:
             logger.error(f"Error retrieving all data from {self.namespace}: {e}")
             return {}
 
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
-        """Get doc_full data by id."""
+        """Get data by id."""
         sql = SQL_TEMPLATES["get_by_id_" + self.namespace]
         params = {"workspace": self.db.workspace, "id": id}
-        if is_namespace(self.namespace, NameSpace.KV_STORE_LLM_RESPONSE_CACHE):
-            array_res = await self.db.query(sql, params, multirows=True)
-            res = {}
-            for row in array_res:
-                res[row["id"]] = row
-            return res if res else None
-        else:
-            response = await self.db.query(sql, params)
-            return response if response else None
+        response = await self.db.query(sql, params)
 
-    async def get_by_mode_and_id(self, mode: str, id: str) -> Union[dict, None]:
-        """Specifically for llm_response_cache."""
-        sql = SQL_TEMPLATES["get_by_mode_id_" + self.namespace]
-        params = {"workspace": self.db.workspace, "mode": mode, "id": id}
-        if is_namespace(self.namespace, NameSpace.KV_STORE_LLM_RESPONSE_CACHE):
-            array_res = await self.db.query(sql, params, multirows=True)
-            res = {}
-            for row in array_res:
-                res[row["id"]] = row
-            return res
-        else:
-            return None
+        if response and is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
+            # Parse llm_cache_list JSON string back to list
+            llm_cache_list = response.get("llm_cache_list", [])
+            if isinstance(llm_cache_list, str):
+                try:
+                    llm_cache_list = json.loads(llm_cache_list)
+                except json.JSONDecodeError:
+                    llm_cache_list = []
+            response["llm_cache_list"] = llm_cache_list
+            create_time = response.get("create_time", 0)
+            update_time = response.get("update_time", 0)
+            response["create_time"] = create_time
+            response["update_time"] = create_time if update_time == 0 else update_time
+
+        # Special handling for LLM cache to ensure compatibility with _get_cached_extraction_results
+        if response and is_namespace(
+            self.namespace, NameSpace.KV_STORE_LLM_RESPONSE_CACHE
+        ):
+            create_time = response.get("create_time", 0)
+            update_time = response.get("update_time", 0)
+            # Map field names and add cache_type for compatibility
+            response = {
+                **response,
+                "return": response.get("return_value", ""),
+                "cache_type": response.get("cache_type"),
+                "original_prompt": response.get("original_prompt", ""),
+                "chunk_id": response.get("chunk_id"),
+                "mode": response.get("mode", "default"),
+                "create_time": create_time,
+                "update_time": create_time if update_time == 0 else update_time,
+            }
+
+        return response if response else None
 
     # Query by id
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
-        """Get doc_chunks data by id"""
+        """Get data by ids"""
         sql = SQL_TEMPLATES["get_by_ids_" + self.namespace].format(
             ids=",".join([f"'{id}'" for id in ids])
         )
         params = {"workspace": self.db.workspace}
-        if is_namespace(self.namespace, NameSpace.KV_STORE_LLM_RESPONSE_CACHE):
-            array_res = await self.db.query(sql, params, multirows=True)
-            modes = set()
-            dict_res: dict[str, dict] = {}
-            for row in array_res:
-                modes.add(row["mode"])
-            for mode in modes:
-                if mode not in dict_res:
-                    dict_res[mode] = {}
-            for row in array_res:
-                dict_res[row["mode"]][row["id"]] = row
-            return [{k: v} for k, v in dict_res.items()]
-        else:
-            return await self.db.query(sql, params, multirows=True)
+        results = await self.db.query(sql, params, multirows=True)
 
-    async def get_by_status(self, status: str) -> Union[list[dict[str, Any]], None]:
-        """Specifically for llm_response_cache."""
-        SQL = SQL_TEMPLATES["get_by_status_" + self.namespace]
-        params = {"workspace": self.db.workspace, "status": status}
-        return await self.db.query(SQL, params, multirows=True)
+        if results and is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
+            # Parse llm_cache_list JSON string back to list for each result
+            for result in results:
+                llm_cache_list = result.get("llm_cache_list", [])
+                if isinstance(llm_cache_list, str):
+                    try:
+                        llm_cache_list = json.loads(llm_cache_list)
+                    except json.JSONDecodeError:
+                        llm_cache_list = []
+                result["llm_cache_list"] = llm_cache_list
+                create_time = result.get("create_time", 0)
+                update_time = result.get("update_time", 0)
+                result["create_time"] = create_time
+                result["update_time"] = create_time if update_time == 0 else update_time
+
+        # Special handling for LLM cache to ensure compatibility with _get_cached_extraction_results
+        if results and is_namespace(
+            self.namespace, NameSpace.KV_STORE_LLM_RESPONSE_CACHE
+        ):
+            processed_results = []
+            for row in results:
+                create_time = row.get("create_time", 0)
+                update_time = row.get("update_time", 0)
+                # Map field names and add cache_type for compatibility
+                processed_row = {
+                    **row,
+                    "return": row.get("return_value", ""),
+                    "cache_type": row.get("cache_type"),
+                    "original_prompt": row.get("original_prompt", ""),
+                    "chunk_id": row.get("chunk_id"),
+                    "mode": row.get("mode", "default"),
+                    "create_time": create_time,
+                    "update_time": create_time if update_time == 0 else update_time,
+                }
+                processed_results.append(processed_row)
+            return processed_results
+
+        return results if results else []
 
     async def filter_keys(self, keys: set[str]) -> set[str]:
         """Filter out duplicated content"""
@@ -520,7 +1023,23 @@ class PGKVStorage(BaseKVStorage):
             return
 
         if is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
-            pass
+            # Get current UTC time and convert to naive datetime for database storage
+            current_time = datetime.datetime.now(timezone.utc).replace(tzinfo=None)
+            for k, v in data.items():
+                upsert_sql = SQL_TEMPLATES["upsert_text_chunk"]
+                _data = {
+                    "workspace": self.db.workspace,
+                    "id": k,
+                    "tokens": v["tokens"],
+                    "chunk_order_index": v["chunk_order_index"],
+                    "full_doc_id": v["full_doc_id"],
+                    "content": v["content"],
+                    "file_path": v["file_path"],
+                    "llm_cache_list": json.dumps(v.get("llm_cache_list", [])),
+                    "create_time": current_time,
+                    "update_time": current_time,
+                }
+                await self.db.execute(upsert_sql, _data)
         elif is_namespace(self.namespace, NameSpace.KV_STORE_FULL_DOCS):
             for k, v in data.items():
                 upsert_sql = SQL_TEMPLATES["upsert_doc_full"]
@@ -531,19 +1050,21 @@ class PGKVStorage(BaseKVStorage):
                 }
                 await self.db.execute(upsert_sql, _data)
         elif is_namespace(self.namespace, NameSpace.KV_STORE_LLM_RESPONSE_CACHE):
-            for mode, items in data.items():
-                for k, v in items.items():
-                    upsert_sql = SQL_TEMPLATES["upsert_llm_response_cache"]
-                    _data = {
-                        "workspace": self.db.workspace,
-                        "id": k,
-                        "original_prompt": v["original_prompt"],
-                        "return_value": v["return"],
-                        "mode": mode,
-                        "chunk_id": v.get("chunk_id"),
-                    }
+            for k, v in data.items():
+                upsert_sql = SQL_TEMPLATES["upsert_llm_response_cache"]
+                _data = {
+                    "workspace": self.db.workspace,
+                    "id": k,  # Use flattened key as id
+                    "original_prompt": v["original_prompt"],
+                    "return_value": v["return"],
+                    "mode": v.get("mode", "default"),  # Get mode from data
+                    "chunk_id": v.get("chunk_id"),
+                    "cache_type": v.get(
+                        "cache_type", "extract"
+                    ),  # Get cache_type from data
+                }
 
-                    await self.db.execute(upsert_sql, _data)
+                await self.db.execute(upsert_sql, _data)
 
     async def index_done_callback(self) -> None:
         # PG handles persistence automatically
@@ -648,6 +1169,18 @@ class PGVectorStorage(BaseVectorStorage):
     async def initialize(self):
         if self.db is None:
             self.db = await ClientManager.get_client()
+            # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
+            if self.db.workspace:
+                # Use PostgreSQLDB's workspace (highest priority)
+                final_workspace = self.db.workspace
+            elif hasattr(self, "workspace") and self.workspace:
+                # Use storage class's workspace (medium priority)
+                final_workspace = self.workspace
+                self.db.workspace = final_workspace
+            else:
+                # Use "default" for compatibility (lowest priority)
+                final_workspace = "default"
+                self.db.workspace = final_workspace
 
     async def finalize(self):
         if self.db is not None:
@@ -729,8 +1262,8 @@ class PGVectorStorage(BaseVectorStorage):
         if not data:
             return
 
-        # Get current time with UTC timezone
-        current_time = datetime.datetime.now(timezone.utc)
+        # Get current UTC time and convert to naive datetime for database storage
+        current_time = datetime.datetime.now(timezone.utc).replace(tzinfo=None)
         list_data = [
             {
                 "__id__": k,
@@ -926,9 +1459,31 @@ class PGVectorStorage(BaseVectorStorage):
 class PGDocStatusStorage(DocStatusStorage):
     db: PostgreSQLDB = field(default=None)
 
+    def _format_datetime_with_timezone(self, dt):
+        """Convert datetime to ISO format string with timezone info"""
+        if dt is None:
+            return None
+        # If no timezone info, assume it's UTC time (as stored in database)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        # If datetime already has timezone info, keep it as is
+        return dt.isoformat()
+
     async def initialize(self):
         if self.db is None:
             self.db = await ClientManager.get_client()
+            # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
+            if self.db.workspace:
+                # Use PostgreSQLDB's workspace (highest priority)
+                final_workspace = self.db.workspace
+            elif hasattr(self, "workspace") and self.workspace:
+                # Use storage class's workspace (medium priority)
+                final_workspace = self.workspace
+                self.db.workspace = final_workspace
+            else:
+                # Use "default" for compatibility (lowest priority)
+                final_workspace = "default"
+                self.db.workspace = final_workspace
 
     async def finalize(self):
         if self.db is not None:
@@ -949,8 +1504,8 @@ class PGDocStatusStorage(DocStatusStorage):
             else:
                 exist_keys = []
             new_keys = set([s for s in keys if s not in exist_keys])
-            print(f"keys: {keys}")
-            print(f"new_keys: {new_keys}")
+            # print(f"keys: {keys}")
+            # print(f"new_keys: {new_keys}")
             return new_keys
         except Exception as e:
             logger.error(
@@ -965,15 +1520,28 @@ class PGDocStatusStorage(DocStatusStorage):
         if result is None or result == []:
             return None
         else:
+            # Parse chunks_list JSON string back to list
+            chunks_list = result[0].get("chunks_list", [])
+            if isinstance(chunks_list, str):
+                try:
+                    chunks_list = json.loads(chunks_list)
+                except json.JSONDecodeError:
+                    chunks_list = []
+
+            # Convert datetime objects to ISO format strings with timezone info
+            created_at = self._format_datetime_with_timezone(result[0]["created_at"])
+            updated_at = self._format_datetime_with_timezone(result[0]["updated_at"])
+
             return dict(
                 content=result[0]["content"],
                 content_length=result[0]["content_length"],
                 content_summary=result[0]["content_summary"],
                 status=result[0]["status"],
                 chunks_count=result[0]["chunks_count"],
-                created_at=result[0]["created_at"],
-                updated_at=result[0]["updated_at"],
+                created_at=created_at,
+                updated_at=updated_at,
                 file_path=result[0]["file_path"],
+                chunks_list=chunks_list,
             )
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
@@ -988,19 +1556,36 @@ class PGDocStatusStorage(DocStatusStorage):
 
         if not results:
             return []
-        return [
-            {
-                "content": row["content"],
-                "content_length": row["content_length"],
-                "content_summary": row["content_summary"],
-                "status": row["status"],
-                "chunks_count": row["chunks_count"],
-                "created_at": row["created_at"],
-                "updated_at": row["updated_at"],
-                "file_path": row["file_path"],
-            }
-            for row in results
-        ]
+
+        processed_results = []
+        for row in results:
+            # Parse chunks_list JSON string back to list
+            chunks_list = row.get("chunks_list", [])
+            if isinstance(chunks_list, str):
+                try:
+                    chunks_list = json.loads(chunks_list)
+                except json.JSONDecodeError:
+                    chunks_list = []
+
+            # Convert datetime objects to ISO format strings with timezone info
+            created_at = self._format_datetime_with_timezone(row["created_at"])
+            updated_at = self._format_datetime_with_timezone(row["updated_at"])
+
+            processed_results.append(
+                {
+                    "content": row["content"],
+                    "content_length": row["content_length"],
+                    "content_summary": row["content_summary"],
+                    "status": row["status"],
+                    "chunks_count": row["chunks_count"],
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                    "file_path": row["file_path"],
+                    "chunks_list": chunks_list,
+                }
+            )
+
+        return processed_results
 
     async def get_status_counts(self) -> dict[str, int]:
         """Get counts of documents in each status"""
@@ -1021,19 +1606,33 @@ class PGDocStatusStorage(DocStatusStorage):
         sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and status=$2"
         params = {"workspace": self.db.workspace, "status": status.value}
         result = await self.db.query(sql, params, True)
-        docs_by_status = {
-            element["id"]: DocProcessingStatus(
+
+        docs_by_status = {}
+        for element in result:
+            # Parse chunks_list JSON string back to list
+            chunks_list = element.get("chunks_list", [])
+            if isinstance(chunks_list, str):
+                try:
+                    chunks_list = json.loads(chunks_list)
+                except json.JSONDecodeError:
+                    chunks_list = []
+
+            # Convert datetime objects to ISO format strings with timezone info
+            created_at = self._format_datetime_with_timezone(element["created_at"])
+            updated_at = self._format_datetime_with_timezone(element["updated_at"])
+
+            docs_by_status[element["id"]] = DocProcessingStatus(
                 content=element["content"],
                 content_summary=element["content_summary"],
                 content_length=element["content_length"],
                 status=element["status"],
-                created_at=element["created_at"],
-                updated_at=element["updated_at"],
+                created_at=created_at,
+                updated_at=updated_at,
                 chunks_count=element["chunks_count"],
                 file_path=element["file_path"],
+                chunks_list=chunks_list,
             )
-            for element in result
-        }
+
         return docs_by_status
 
     async def index_done_callback(self) -> None:
@@ -1080,27 +1679,34 @@ class PGDocStatusStorage(DocStatusStorage):
             return
 
         def parse_datetime(dt_str):
+            """Parse datetime and ensure it's stored as UTC time in database"""
             if dt_str is None:
                 return None
             if isinstance(dt_str, (datetime.date, datetime.datetime)):
-                # If it's a datetime object without timezone info, remove timezone info
+                # If it's a datetime object
                 if isinstance(dt_str, datetime.datetime):
-                    # Remove timezone info, return naive datetime object
-                    return dt_str.replace(tzinfo=None)
+                    # If no timezone info, assume it's UTC
+                    if dt_str.tzinfo is None:
+                        dt_str = dt_str.replace(tzinfo=timezone.utc)
+                    # Convert to UTC and remove timezone info for storage
+                    return dt_str.astimezone(timezone.utc).replace(tzinfo=None)
                 return dt_str
             try:
                 # Process ISO format string with timezone
                 dt = datetime.datetime.fromisoformat(dt_str)
-                # Remove timezone info, return naive datetime object
-                return dt.replace(tzinfo=None)
+                # If no timezone info, assume it's UTC
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                # Convert to UTC and remove timezone info for storage
+                return dt.astimezone(timezone.utc).replace(tzinfo=None)
             except (ValueError, TypeError):
                 logger.warning(f"Unable to parse datetime string: {dt_str}")
                 return None
 
-        # Modified SQL to include created_at and updated_at in both INSERT and UPDATE operations
-        # Both fields are updated from the input data in both INSERT and UPDATE cases
-        sql = """insert into LIGHTRAG_DOC_STATUS(workspace,id,content,content_summary,content_length,chunks_count,status,file_path,created_at,updated_at)
-                 values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        # Modified SQL to include created_at, updated_at, and chunks_list in both INSERT and UPDATE operations
+        # All fields are updated from the input data in both INSERT and UPDATE cases
+        sql = """insert into LIGHTRAG_DOC_STATUS(workspace,id,content,content_summary,content_length,chunks_count,status,file_path,chunks_list,created_at,updated_at)
+                 values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                   on conflict(id,workspace) do update set
                   content = EXCLUDED.content,
                   content_summary = EXCLUDED.content_summary,
@@ -1108,6 +1714,7 @@ class PGDocStatusStorage(DocStatusStorage):
                   chunks_count = EXCLUDED.chunks_count,
                   status = EXCLUDED.status,
                   file_path = EXCLUDED.file_path,
+                  chunks_list = EXCLUDED.chunks_list,
                   created_at = EXCLUDED.created_at,
                   updated_at = EXCLUDED.updated_at"""
         for k, v in data.items():
@@ -1115,7 +1722,7 @@ class PGDocStatusStorage(DocStatusStorage):
             created_at = parse_datetime(v.get("created_at"))
             updated_at = parse_datetime(v.get("updated_at"))
 
-            # chunks_count is optional
+            # chunks_count and chunks_list are optional
             await self.db.execute(
                 sql,
                 {
@@ -1127,6 +1734,7 @@ class PGDocStatusStorage(DocStatusStorage):
                     "chunks_count": v["chunks_count"] if "chunks_count" in v else -1,
                     "status": v["status"],
                     "file_path": v["file_path"],
+                    "chunks_list": json.dumps(v.get("chunks_list", [])),
                     "created_at": created_at,  # Use the converted datetime object
                     "updated_at": updated_at,  # Use the converted datetime object
                 },
@@ -1173,8 +1781,33 @@ class PGGraphQueryException(Exception):
 @dataclass
 class PGGraphStorage(BaseGraphStorage):
     def __post_init__(self):
-        self.graph_name = self.namespace or os.environ.get("AGE_GRAPH_NAME", "lightrag")
+        # Graph name will be dynamically generated in initialize() based on workspace
         self.db: PostgreSQLDB | None = None
+
+    def _get_workspace_graph_name(self) -> str:
+        """
+        Generate graph name based on workspace and namespace for data isolation.
+        Rules:
+        - If workspace is empty or "default": graph_name = namespace
+        - If workspace has other value: graph_name = workspace_namespace
+
+        Args:
+            None
+
+        Returns:
+            str: The graph name for the current workspace
+        """
+        workspace = getattr(self, "workspace", None)
+        namespace = self.namespace
+
+        if workspace and workspace.strip() and workspace.strip().lower() != "default":
+            # Ensure names comply with PostgreSQL identifier specifications
+            safe_workspace = re.sub(r"[^a-zA-Z0-9_]", "_", workspace.strip())
+            safe_namespace = re.sub(r"[^a-zA-Z0-9_]", "_", namespace)
+            return f"{safe_workspace}_{safe_namespace}"
+        else:
+            # When workspace is empty or "default", use namespace directly
+            return re.sub(r"[^a-zA-Z0-9_]", "_", namespace)
 
     @staticmethod
     def _normalize_node_id(node_id: str) -> str:
@@ -1196,6 +1829,27 @@ class PGGraphStorage(BaseGraphStorage):
     async def initialize(self):
         if self.db is None:
             self.db = await ClientManager.get_client()
+            # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > None
+            if self.db.workspace:
+                # Use PostgreSQLDB's workspace (highest priority)
+                final_workspace = self.db.workspace
+            elif hasattr(self, "workspace") and self.workspace:
+                # Use storage class's workspace (medium priority)
+                final_workspace = self.workspace
+                self.db.workspace = final_workspace
+            else:
+                # Use None for compatibility (lowest priority)
+                final_workspace = None
+                self.db.workspace = final_workspace
+
+        # Dynamically generate graph name based on workspace
+        self.workspace = self.db.workspace
+        self.graph_name = self._get_workspace_graph_name()
+
+        # Log the graph initialization for debugging
+        logger.info(
+            f"PostgreSQL Graph initialized: workspace='{self.workspace}', graph_name='{self.graph_name}'"
+        )
 
         # Execute each statement separately and ignore errors
         queries = [
@@ -1251,53 +1905,101 @@ class PGGraphStorage(BaseGraphStorage):
                 the dictionary key is the field name and the value is the
                 value converted to a python type
         """
+
+        @staticmethod
+        def parse_agtype_string(agtype_str: str) -> tuple[str, str]:
+            """
+            Parse agtype string precisely, separating JSON content and type identifier
+
+            Args:
+                agtype_str: String like '{"json": "content"}::vertex'
+
+            Returns:
+                (json_content, type_identifier)
+            """
+            if not isinstance(agtype_str, str) or "::" not in agtype_str:
+                return agtype_str, ""
+
+            # Find the last :: from the right, which is the start of type identifier
+            last_double_colon = agtype_str.rfind("::")
+
+            if last_double_colon == -1:
+                return agtype_str, ""
+
+            # Separate JSON content and type identifier
+            json_content = agtype_str[:last_double_colon]
+            type_identifier = agtype_str[last_double_colon + 2 :]
+
+            return json_content, type_identifier
+
+        @staticmethod
+        def safe_json_parse(json_str: str, context: str = "") -> dict:
+            """
+            Safe JSON parsing with simplified error logging
+            """
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON parsing failed ({context}): {e}")
+                logger.error(f"Raw data (first 100 chars): {repr(json_str[:100])}")
+                logger.error(f"Error position: line {e.lineno}, column {e.colno}")
+                return None
+
         # result holder
         d = {}
 
         # prebuild a mapping of vertex_id to vertex mappings to be used
         # later to build edges
         vertices = {}
+
+        # First pass: preprocess vertices
         for k in record.keys():
             v = record[k]
-            # agtype comes back '{key: value}::type' which must be parsed
             if isinstance(v, str) and "::" in v:
                 if v.startswith("[") and v.endswith("]"):
-                    if "::vertex" not in v:
-                        continue
-                    v = v.replace("::vertex", "")
-                    vertexes = json.loads(v)
-                    for vertex in vertexes:
-                        vertices[vertex["id"]] = vertex.get("properties")
+                    # Handle vertex arrays
+                    json_content, type_id = parse_agtype_string(v)
+                    if type_id == "vertex":
+                        vertexes = safe_json_parse(
+                            json_content, f"vertices array for {k}"
+                        )
+                        if vertexes:
+                            for vertex in vertexes:
+                                vertices[vertex["id"]] = vertex.get("properties")
                 else:
-                    dtype = v.split("::")[-1]
-                    v = v.split("::")[0]
-                    if dtype == "vertex":
-                        vertex = json.loads(v)
-                        vertices[vertex["id"]] = vertex.get("properties")
+                    # Handle single vertex
+                    json_content, type_id = parse_agtype_string(v)
+                    if type_id == "vertex":
+                        vertex = safe_json_parse(json_content, f"single vertex for {k}")
+                        if vertex:
+                            vertices[vertex["id"]] = vertex.get("properties")
 
-        # iterate returned fields and parse appropriately
+        # Second pass: process all fields
         for k in record.keys():
             v = record[k]
             if isinstance(v, str) and "::" in v:
                 if v.startswith("[") and v.endswith("]"):
-                    if "::vertex" in v:
-                        v = v.replace("::vertex", "")
-                        d[k] = json.loads(v)
-
-                    elif "::edge" in v:
-                        v = v.replace("::edge", "")
-                        d[k] = json.loads(v)
+                    # Handle array types
+                    json_content, type_id = parse_agtype_string(v)
+                    if type_id in ["vertex", "edge"]:
+                        parsed_data = safe_json_parse(
+                            json_content, f"array {type_id} for field {k}"
+                        )
+                        d[k] = parsed_data if parsed_data is not None else None
                     else:
-                        print("WARNING: unsupported type")
-                        continue
-
+                        logger.warning(f"Unknown array type: {type_id}")
+                        d[k] = None
                 else:
-                    dtype = v.split("::")[-1]
-                    v = v.split("::")[0]
-                    if dtype == "vertex":
-                        d[k] = json.loads(v)
-                    elif dtype == "edge":
-                        d[k] = json.loads(v)
+                    # Handle single objects
+                    json_content, type_id = parse_agtype_string(v)
+                    if type_id in ["vertex", "edge"]:
+                        parsed_data = safe_json_parse(
+                            json_content, f"single {type_id} for field {k}"
+                        )
+                        d[k] = parsed_data if parsed_data is not None else None
+                    else:
+                        # May be other types of agtype data, keep as is
+                        d[k] = v
             else:
                 d[k] = v  # Keep as string
 
@@ -2276,7 +2978,7 @@ class PGGraphStorage(BaseGraphStorage):
         self,
         node_label: str,
         max_depth: int = 3,
-        max_nodes: int = MAX_GRAPH_NODES,
+        max_nodes: int = None,
     ) -> KnowledgeGraph:
         """
         Retrieve a connected subgraph of nodes where the label includes the specified `node_label`.
@@ -2284,12 +2986,18 @@ class PGGraphStorage(BaseGraphStorage):
         Args:
             node_label: Label of the starting node, * means all nodes
             max_depth: Maximum depth of the subgraph, Defaults to 3
-            max_nodes: Maxiumu nodes to return, Defaults to 1000
+            max_nodes: Maximum nodes to return, Defaults to global_config max_graph_nodes
 
         Returns:
             KnowledgeGraph object containing nodes and edges, with an is_truncated flag
             indicating whether the graph was truncated due to max_nodes limit
         """
+        # Use global_config max_graph_nodes as default if max_nodes is None
+        if max_nodes is None:
+            max_nodes = self.global_config.get("max_graph_nodes", 1000)
+        else:
+            # Limit max_nodes to not exceed global_config max_graph_nodes
+            max_nodes = min(max_nodes, self.global_config.get("max_graph_nodes", 1000))
         kg = KnowledgeGraph()
 
         # Handle wildcard query - get all nodes
@@ -2400,7 +3108,10 @@ class PGGraphStorage(BaseGraphStorage):
                             $$) AS (result agtype)"""
 
             await self._query(drop_query, readonly=False)
-            return {"status": "success", "message": "graph data dropped"}
+            return {
+                "status": "success",
+                "message": f"workspace '{self.workspace}' graph data dropped",
+            }
         except Exception as e:
             logger.error(f"Error dropping graph: {e}")
             return {"status": "error", "message": str(e)}
@@ -2409,7 +3120,7 @@ class PGGraphStorage(BaseGraphStorage):
 NAMESPACE_TABLE_MAP = {
     NameSpace.KV_STORE_FULL_DOCS: "LIGHTRAG_DOC_FULL",
     NameSpace.KV_STORE_TEXT_CHUNKS: "LIGHTRAG_DOC_CHUNKS",
-    NameSpace.VECTOR_STORE_CHUNKS: "LIGHTRAG_DOC_CHUNKS",
+    NameSpace.VECTOR_STORE_CHUNKS: "LIGHTRAG_VDB_CHUNKS",
     NameSpace.VECTOR_STORE_ENTITIES: "LIGHTRAG_VDB_ENTITY",
     NameSpace.VECTOR_STORE_RELATIONSHIPS: "LIGHTRAG_VDB_RELATION",
     NameSpace.DOC_STATUS: "LIGHTRAG_DOC_STATUS",
@@ -2431,8 +3142,8 @@ TABLES = {
                     doc_name VARCHAR(1024),
                     content TEXT,
                     meta JSONB,
-                    create_time TIMESTAMP(0),
-                    update_time TIMESTAMP(0),
+                    create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
 	                CONSTRAINT LIGHTRAG_DOC_FULL_PK PRIMARY KEY (workspace, id)
                     )"""
     },
@@ -2444,22 +3155,37 @@ TABLES = {
                     chunk_order_index INTEGER,
                     tokens INTEGER,
                     content TEXT,
-                    content_vector VECTOR,
-                    file_path VARCHAR(256),
-                    create_time TIMESTAMP(0) WITH TIME ZONE,
-                    update_time TIMESTAMP(0) WITH TIME ZONE,
+                    file_path TEXT NULL,
+                    llm_cache_list JSONB NULL DEFAULT '[]'::jsonb,
+                    create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
 	                CONSTRAINT LIGHTRAG_DOC_CHUNKS_PK PRIMARY KEY (workspace, id)
+                    )"""
+    },
+    "LIGHTRAG_VDB_CHUNKS": {
+        "ddl": """CREATE TABLE LIGHTRAG_VDB_CHUNKS (
+                    id VARCHAR(255),
+                    workspace VARCHAR(255),
+                    full_doc_id VARCHAR(256),
+                    chunk_order_index INTEGER,
+                    tokens INTEGER,
+                    content TEXT,
+                    content_vector VECTOR,
+                    file_path TEXT NULL,
+                    create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+	                CONSTRAINT LIGHTRAG_VDB_CHUNKS_PK PRIMARY KEY (workspace, id)
                     )"""
     },
     "LIGHTRAG_VDB_ENTITY": {
         "ddl": """CREATE TABLE LIGHTRAG_VDB_ENTITY (
                     id VARCHAR(255),
                     workspace VARCHAR(255),
-                    entity_name VARCHAR(255),
+                    entity_name VARCHAR(512),
                     content TEXT,
                     content_vector VECTOR,
-                    create_time TIMESTAMP(0) WITH TIME ZONE,
-                    update_time TIMESTAMP(0) WITH TIME ZONE,
+                    create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     chunk_ids VARCHAR(255)[] NULL,
                     file_path TEXT NULL,
 	                CONSTRAINT LIGHTRAG_VDB_ENTITY_PK PRIMARY KEY (workspace, id)
@@ -2469,12 +3195,12 @@ TABLES = {
         "ddl": """CREATE TABLE LIGHTRAG_VDB_RELATION (
                     id VARCHAR(255),
                     workspace VARCHAR(255),
-                    source_id VARCHAR(256),
-                    target_id VARCHAR(256),
+                    source_id VARCHAR(512),
+                    target_id VARCHAR(512),
                     content TEXT,
                     content_vector VECTOR,
-                    create_time TIMESTAMP(0) WITH TIME ZONE,
-                    update_time TIMESTAMP(0) WITH TIME ZONE,
+                    create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
+                    update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     chunk_ids VARCHAR(255)[] NULL,
                     file_path TEXT NULL,
 	                CONSTRAINT LIGHTRAG_VDB_RELATION_PK PRIMARY KEY (workspace, id)
@@ -2489,7 +3215,7 @@ TABLES = {
                     return_value TEXT,
                     chunk_id VARCHAR(255) NULL,
                     create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    update_time TIMESTAMP,
+                    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 	                CONSTRAINT LIGHTRAG_LLM_CACHE_PK PRIMARY KEY (workspace, mode, id)
                     )"""
     },
@@ -2503,8 +3229,9 @@ TABLES = {
 	               chunks_count int4 NULL,
 	               status varchar(64) NULL,
 	               file_path TEXT NULL,
-	               created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NULL,
-	               updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NULL,
+	               chunks_list JSONB NULL DEFAULT '[]'::jsonb,
+	               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+	               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 	               CONSTRAINT LIGHTRAG_DOC_STATUS_PK PRIMARY KEY (workspace, id)
 	              )"""
     },
@@ -2517,24 +3244,34 @@ SQL_TEMPLATES = {
                                 FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id=$2
                             """,
     "get_by_id_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
-                                chunk_order_index, full_doc_id, file_path
+                                chunk_order_index, full_doc_id, file_path,
+                                COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
+                                EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
+                                EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
                                 FROM LIGHTRAG_DOC_CHUNKS WHERE workspace=$1 AND id=$2
                             """,
-    "get_by_id_llm_response_cache": """SELECT id, original_prompt, COALESCE(return_value, '') as "return", mode, chunk_id
-                                FROM LIGHTRAG_LLM_CACHE WHERE workspace=$1 AND mode=$2
+    "get_by_id_llm_response_cache": """SELECT id, original_prompt, return_value, mode, chunk_id, cache_type,
+                                EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
+                                EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
+                                FROM LIGHTRAG_LLM_CACHE WHERE workspace=$1 AND id=$2
                                """,
-    "get_by_mode_id_llm_response_cache": """SELECT id, original_prompt, COALESCE(return_value, '') as "return", mode, chunk_id
+    "get_by_mode_id_llm_response_cache": """SELECT id, original_prompt, return_value, mode, chunk_id
                            FROM LIGHTRAG_LLM_CACHE WHERE workspace=$1 AND mode=$2 AND id=$3
                           """,
     "get_by_ids_full_docs": """SELECT id, COALESCE(content, '') as content
                                  FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id IN ({ids})
                             """,
     "get_by_ids_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
-                                  chunk_order_index, full_doc_id, file_path
+                                  chunk_order_index, full_doc_id, file_path,
+                                  COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
+                                  EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
+                                  EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
                                    FROM LIGHTRAG_DOC_CHUNKS WHERE workspace=$1 AND id IN ({ids})
                                 """,
-    "get_by_ids_llm_response_cache": """SELECT id, original_prompt, COALESCE(return_value, '') as "return", mode, chunk_id
-                                 FROM LIGHTRAG_LLM_CACHE WHERE workspace=$1 AND mode= IN ({ids})
+    "get_by_ids_llm_response_cache": """SELECT id, original_prompt, return_value, mode, chunk_id, cache_type,
+                                 EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
+                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
+                                 FROM LIGHTRAG_LLM_CACHE WHERE workspace=$1 AND id IN ({ids})
                                 """,
     "filter_keys": "SELECT id FROM {table_name} WHERE workspace=$1 AND id IN ({ids})",
     "upsert_doc_full": """INSERT INTO LIGHTRAG_DOC_FULL (id, content, workspace)
@@ -2542,16 +3279,31 @@ SQL_TEMPLATES = {
                         ON CONFLICT (workspace,id) DO UPDATE
                            SET content = $2, update_time = CURRENT_TIMESTAMP
                        """,
-    "upsert_llm_response_cache": """INSERT INTO LIGHTRAG_LLM_CACHE(workspace,id,original_prompt,return_value,mode,chunk_id)
-                                      VALUES ($1, $2, $3, $4, $5, $6)
+    "upsert_llm_response_cache": """INSERT INTO LIGHTRAG_LLM_CACHE(workspace,id,original_prompt,return_value,mode,chunk_id,cache_type)
+                                      VALUES ($1, $2, $3, $4, $5, $6, $7)
                                       ON CONFLICT (workspace,mode,id) DO UPDATE
                                       SET original_prompt = EXCLUDED.original_prompt,
                                       return_value=EXCLUDED.return_value,
                                       mode=EXCLUDED.mode,
                                       chunk_id=EXCLUDED.chunk_id,
+                                      cache_type=EXCLUDED.cache_type,
                                       update_time = CURRENT_TIMESTAMP
                                      """,
-    "upsert_chunk": """INSERT INTO LIGHTRAG_DOC_CHUNKS (workspace, id, tokens,
+    "upsert_text_chunk": """INSERT INTO LIGHTRAG_DOC_CHUNKS (workspace, id, tokens,
+                      chunk_order_index, full_doc_id, content, file_path, llm_cache_list,
+                      create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                      ON CONFLICT (workspace,id) DO UPDATE
+                      SET tokens=EXCLUDED.tokens,
+                      chunk_order_index=EXCLUDED.chunk_order_index,
+                      full_doc_id=EXCLUDED.full_doc_id,
+                      content = EXCLUDED.content,
+                      file_path=EXCLUDED.file_path,
+                      llm_cache_list=EXCLUDED.llm_cache_list,
+                      update_time = EXCLUDED.update_time
+                     """,
+    # SQL for VectorStorage
+    "upsert_chunk": """INSERT INTO LIGHTRAG_VDB_CHUNKS (workspace, id, tokens,
                       chunk_order_index, full_doc_id, content, content_vector, file_path,
                       create_time, update_time)
                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -2564,7 +3316,6 @@ SQL_TEMPLATES = {
                       file_path=EXCLUDED.file_path,
                       update_time = EXCLUDED.update_time
                      """,
-    # SQL for VectorStorage
     "upsert_entity": """INSERT INTO LIGHTRAG_VDB_ENTITY (workspace, id, entity_name, content,
                       content_vector, chunk_ids, file_path, create_time, update_time)
                       VALUES ($1, $2, $3, $4, $5, $6::varchar[], $7, $8, $9)
@@ -2591,7 +3342,7 @@ SQL_TEMPLATES = {
     "relationships": """
     WITH relevant_chunks AS (
         SELECT id as chunk_id
-        FROM LIGHTRAG_DOC_CHUNKS
+        FROM LIGHTRAG_VDB_CHUNKS
         WHERE $2::varchar[] IS NULL OR full_doc_id = ANY($2::varchar[])
     )
     SELECT source_id as src_id, target_id as tgt_id, EXTRACT(EPOCH FROM create_time)::BIGINT as created_at
@@ -2608,7 +3359,7 @@ SQL_TEMPLATES = {
     "entities": """
         WITH relevant_chunks AS (
             SELECT id as chunk_id
-            FROM LIGHTRAG_DOC_CHUNKS
+            FROM LIGHTRAG_VDB_CHUNKS
             WHERE $2::varchar[] IS NULL OR full_doc_id = ANY($2::varchar[])
         )
         SELECT entity_name, EXTRACT(EPOCH FROM create_time)::BIGINT as created_at FROM
@@ -2625,13 +3376,13 @@ SQL_TEMPLATES = {
     "chunks": """
         WITH relevant_chunks AS (
             SELECT id as chunk_id
-            FROM LIGHTRAG_DOC_CHUNKS
+            FROM LIGHTRAG_VDB_CHUNKS
             WHERE $2::varchar[] IS NULL OR full_doc_id = ANY($2::varchar[])
         )
         SELECT id, content, file_path, EXTRACT(EPOCH FROM create_time)::BIGINT as created_at FROM
             (
                 SELECT id, content, file_path, create_time, 1 - (content_vector <=> '[{embedding_string}]'::vector) as distance
-                FROM LIGHTRAG_DOC_CHUNKS
+                FROM LIGHTRAG_VDB_CHUNKS
                 WHERE workspace=$1
                 AND id IN (SELECT chunk_id FROM relevant_chunks)
             ) as chunk_distances

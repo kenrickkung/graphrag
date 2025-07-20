@@ -103,7 +103,6 @@ async def initialize_rag(working_dir, vector_storage="NanoVectorDBStorage", debu
         working_dir=working_dir,
         vector_storage=vector_storage,
         llm_model_func=llm_model_func,
-        llm_model_max_async=1,
         embedding_func=EmbeddingFunc(
             embedding_dim=768,
             max_token_size=8192,

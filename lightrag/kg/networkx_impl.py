@@ -12,9 +12,6 @@ import pipmaster as pm
 if not pm.is_installed("networkx"):
     pm.install("networkx")
 
-if not pm.is_installed("graspologic"):
-    pm.install("graspologic")
-
 import networkx as nx
 from .shared_storage import (
     get_storage_lock,
@@ -28,8 +25,6 @@ from dotenv import load_dotenv
 # allows to use different .env file for each lightrag instance
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path=".env", override=False)
-
-MAX_GRAPH_NODES = int(os.getenv("MAX_GRAPH_NODES", 1000))
 
 
 @final
@@ -49,9 +44,19 @@ class NetworkXStorage(BaseGraphStorage):
         nx.write_graphml(graph, file_name)
 
     def __post_init__(self):
-        self._graphml_xml_file = os.path.join(
-            self.global_config["working_dir"], f"graph_{self.namespace}.graphml"
-        )
+        working_dir = self.global_config["working_dir"]
+        if self.workspace:
+            # Include workspace in the file path for data isolation
+            workspace_dir = os.path.join(working_dir, self.workspace)
+            os.makedirs(workspace_dir, exist_ok=True)
+            self._graphml_xml_file = os.path.join(
+                workspace_dir, f"graph_{self.namespace}.graphml"
+            )
+        else:
+            # Default behavior when workspace is empty
+            self._graphml_xml_file = os.path.join(
+                working_dir, f"graph_{self.namespace}.graphml"
+            )
         self._storage_lock = None
         self.storage_updated = None
         self._graph = None
@@ -109,7 +114,9 @@ class NetworkXStorage(BaseGraphStorage):
 
     async def edge_degree(self, src_id: str, tgt_id: str) -> int:
         graph = await self._get_graph()
-        return graph.degree(src_id) + graph.degree(tgt_id)
+        src_degree = graph.degree(src_id) if graph.has_node(src_id) else 0
+        tgt_degree = graph.degree(tgt_id) if graph.has_node(tgt_id) else 0
+        return src_degree + tgt_degree
 
     async def get_edge(
         self, source_node_id: str, target_node_id: str
@@ -209,7 +216,7 @@ class NetworkXStorage(BaseGraphStorage):
         self,
         node_label: str,
         max_depth: int = 3,
-        max_nodes: int = MAX_GRAPH_NODES,
+        max_nodes: int = None,
     ) -> KnowledgeGraph:
         """
         Retrieve a connected subgraph of nodes where the label includes the specified `node_label`.
@@ -223,6 +230,13 @@ class NetworkXStorage(BaseGraphStorage):
             KnowledgeGraph object containing nodes and edges, with an is_truncated flag
             indicating whether the graph was truncated due to max_nodes limit
         """
+        # Get max_nodes from global_config if not provided
+        if max_nodes is None:
+            max_nodes = self.global_config.get("max_graph_nodes", 1000)
+        else:
+            # Limit max_nodes to not exceed global_config max_graph_nodes
+            max_nodes = min(max_nodes, self.global_config.get("max_graph_nodes", 1000))
+
         graph = await self._get_graph()
 
         result = KnowledgeGraph()
