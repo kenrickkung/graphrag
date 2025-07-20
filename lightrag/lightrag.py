@@ -1539,7 +1539,7 @@ class LightRAG:
         # Save original query for vector search
         param.original_query = query
 
-        if param.mode in ["local", "global", "hybrid", "mix"]:
+        if param.mode in ["local", "global", "hybrid", "mix", "late-interaction"]:
             response = await kg_query(
                 query.strip(),
                 self.chunk_entity_relation_graph,
