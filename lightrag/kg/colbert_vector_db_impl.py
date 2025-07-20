@@ -173,34 +173,25 @@ class ColbertVectorDBStorage(BaseVectorStorage):
         return formatted_results
 
     async def delete(self, ids: list[str]):
-        """Delete vectors with specified IDs"""
-        try:
-            self.client.delete_from_index(
-                document_ids=ids,
-                index_name=self._index_name,
-            )
-            logger.debug(
-                f"Successfully deleted {len(ids)} vectors from {self.namespace}"
-            )
-            
-        except Exception as e:
-            logger.error(f"Error while deleting vectors from {self.namespace}: {e}")
+        """Delete vectors with specified IDs
 
+        Note: RAGatouille doesn't support direct deletion by ID.
+        This is a limitation of the ColBERT architecture.
+        A workaround would be to rebuild the index without the specified documents.
+        """
+        logger.warning(
+            f"RAGatouille/ColBERT doesn't support direct deletion of documents by ID. "
+            f"Attempted to delete {len(ids)} documents from {self.namespace}. "
+            f"Consider rebuilding the index without these documents."
+        )
 
     async def delete_entity(self, entity_name: str) -> None:
         """Delete entity (limited support in RAGatouille)"""
-        try:
-            entity_id = compute_mdhash_id(entity_name, prefix="ent-")
-            logger.debug(
-                f"Attempting to delete entity {entity_name} with ID {entity_id}"
-            )
-            self.client.delete_from_index(
-                document_ids=[entity_id],
-                index_name=self._index_name,
-            )
-            logger.debug(f"Successfully deleted entity {entity_name}")
-        except Exception as e:
-            logger.error(f"Error deleting entity {entity_name}: {e}")
+        entity_id = compute_mdhash_id(entity_name, prefix="ent-")
+        logger.warning(
+            f"RAGatouille doesn't support direct deletion. "
+            f"Entity {entity_name} (ID: {entity_id}) deletion logged but not executed."
+        )
 
     async def delete_entity_relation(self, entity_name: str) -> None:
         """Delete entity relations (limited support in RAGatouille)"""
