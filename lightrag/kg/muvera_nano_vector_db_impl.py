@@ -65,9 +65,9 @@ class MuveraNanoVectorDBStorage(BaseVectorStorage):
         self._max_batch_size = self.global_config["embedding_batch_num"]
 
         self.muvera_config = FixedDimensionalEncodingConfig(
-            dimension=768,              # Vector dimension
-            num_repetitions=20,         # Number of independent partitionings
-            num_simhash_projections=5,  # Creates 2^6 = 64 partitions
+            dimension=768,
+            num_repetitions=20,
+            num_simhash_projections=5,
             projection_type=ProjectionType.AMS_SKETCH,
             projection_dimension=32,
             seed=42,

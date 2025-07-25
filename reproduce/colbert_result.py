@@ -71,7 +71,7 @@ def run_queries_and_save_to_json(
 def main():
     load_dotenv()
 
-    cls = "small_agri"
+    cls = "agri3"
     mode = "late-interaction"
 
     query_param = QueryParam(mode=mode)
