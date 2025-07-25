@@ -21,7 +21,7 @@ def get_summary(context, tot_tokens=2000):
     return summary
 
 load_dotenv()
-clses = ["small_agri"]
+clses = ["agri3"]
 for cls in clses:
     with open(f"UltraDomain/{cls}_unique_contexts.json", mode="r") as f:
         unique_contexts = json.load(f)

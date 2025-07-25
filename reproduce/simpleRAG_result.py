@@ -60,13 +60,16 @@ def run_queries_and_save_to_json(
 if __name__ == "__main__":
     load_dotenv()
 
-    cls = "small_agri"
-    mode = "hybrid"
-    WORKING_DIR = f"{cls}"
+    cls = "agri3"
 
-    rag = SimpleRAG(f"SimpleRAG_{cls}")
+    rag = SimpleRAG(
+        f"storage/SimpleRAG_{cls}",
+        model="gemini/gemini-2.5-pro",
+        embedding_model="gemini/text-embedding-004",
+        debug=True
+    )
     insert_text(rag, f"UltraDomain/{cls}_unique_contexts.json")
     queries = extract_queries(f"UltraDomain/{cls}_questions.txt")
     run_queries_and_save_to_json(
-        queries, rag, f"{cls}_result_simplerag.json", f"{cls}_errors_simplerag.json"
+        queries, rag, f"results/{cls}_result_simplerag.json", f"results/{cls}_errors_simplerag.json"
     )

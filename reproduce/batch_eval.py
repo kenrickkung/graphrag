@@ -4,6 +4,7 @@ from litellm import completion
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+# MODEL = "gemini/gemini-2.0-flash"
 MODEL = "gemini/gemini-2.5-pro"
 
 
@@ -76,40 +77,34 @@ def batch_eval(query_file, result1_file, result2_file, output_file_path):
             }}
         }}
         """
-        
-        try:
-            # Use LiteLLM with Gemini
-            response = completion(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.1,
-            )
-            
-            evaluation_result = {
-                "request_id": f"request-{i+1}",
-                "query": query,
-                "answer1": answer1,
-                "answer2": answer2,
-                "evaluation": response.choices[0].message.content,
-                "model": MODEL
-            }
-            
-            results.append(evaluation_result)
-            
-        except Exception as e:
-            print(f"Error processing evaluation {i+1}: {str(e)}")
-            error_result = {
-                "request_id": f"request-{i+1}",
-                "query": query,
-                "answer1": answer1,
-                "answer2": answer2,
-                "evaluation": f"Error: {str(e)}",
-                "model": MODEL
-            }
-            results.append(error_result)
+
+        while True:
+            try:
+                # Use LiteLLM with Gemini
+                response = completion(
+                    model=MODEL,
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.1,
+                )
+                
+                evaluation_result = {
+                    "request_id": f"request-{i+1}",
+                    "query": query,
+                    "answer1": answer1,
+                    "answer2": answer2,
+                    "evaluation": response.choices[0].message.content,
+                    "model": MODEL
+                }
+                
+                results.append(evaluation_result)
+                break
+                
+            except Exception as e:
+                print(f"Error processing evaluation {i+1}: {str(e)}")
+                print("Retrying...")
     
     with open(output_file_path, "w") as f:
         json.dump(results, f, indent=2)
@@ -119,10 +114,10 @@ def batch_eval(query_file, result1_file, result2_file, output_file_path):
 
 if __name__ == "__main__":
     load_dotenv()
-    cls = "small_agri"
+    cls = "agri3"
     query_file = f"UltraDomain/{cls}_questions.txt"
-    result1_file = f"results/{cls}_result_simplerag.json" 
+    result1_file = f"results/muvera_{cls}_result.json" 
     result2_file = f"results/{cls}_result.json"
-    output_file = f"results/{cls}_evaluation_simple_lightrag.json"
+    output_file = f"results/{cls}_evaluation_muvera_lightrag.json"
     
     batch_eval(query_file, result1_file, result2_file, output_file)

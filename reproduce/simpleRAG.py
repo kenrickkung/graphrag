@@ -3,15 +3,20 @@ import os
 from sklearn.metrics.pairwise import cosine_similarity
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import numpy as np
+import litellm
 from litellm import completion, embedding
 from dotenv import load_dotenv
+import time
 
 
 class SimpleRAG:
-    def __init__(self, working_dir, model = "gpt-4.1", embedding_model = "text-embedding-3-large"):
+    def __init__(self, working_dir, model = "gpt-4.1", embedding_model = "text-embedding-3-large", debug=False):
         self.working_dir = working_dir
         self.model = model
         self.embedding_model = embedding_model
+
+        if debug:
+            litellm._turn_on_debug()
         
         self.documents = []
         self.document_embeddings = None
@@ -74,7 +79,7 @@ class SimpleRAG:
     
         return np.array(all_embeddings, dtype=np.float32)
 
-    def query(self, query_text, top_k = 5):
+    def query(self, query_text, top_k = 10):
         if len(self.documents) == 0:
             return "No documents available in the knowledge base."
         
@@ -108,22 +113,28 @@ class SimpleRAG:
         
         Please provide a comprehensive answer based on the context above.
         """
+        last_exception = None
+
+        for i in range(3):
+            try:
+                response = completion(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                )
+                
+                return response.choices[0].message.content
+                
+            except Exception as e:
+                last_exception = e
+                print(f"Attempt: {i+1}/3: Error generating response: {str(e)}")
+                time.sleep(3)
         
-        try:
-            response = completion(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,
-                max_tokens=1000,
-            )
-            
-            return response.choices[0].message.content
-            
-        except Exception as e:
-            return f"Error generating response: {str(e)}"
+        raise last_exception
+        
     
     def save_data(self):
         with open(self.docs_file, 'w', encoding='utf-8') as f:

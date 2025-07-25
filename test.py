@@ -105,5 +105,9 @@ def test_with_sample_data(rag: LightRAG):
 
 if __name__ == "__main__":
     load_dotenv()
-    rag = asyncio.run(initialize_rag("test", "ColbertVectorDBStorage"))
+    rag = asyncio.run(initialize_rag(
+        working_dir="test",
+        vector_storage="MuveraNanoVectorDBStorage",
+        debug=False
+    ))
     test_with_sample_data(rag)

@@ -7,15 +7,21 @@ from lightrag.kg.shared_storage import initialize_pipeline_status
 from litellm import completion, embedding
 import logging
 import asyncio
+from transformers import AutoTokenizer, AutoModel
+import torch
 
 class Config:
     use_gemini = True
     if use_gemini:
         LLM_MODEL = "gemini/gemini-2.5-pro"
+        # LLM_MODEL = "gemini/gemini-2.0-flash"
         EMBEDDING_MODEL = "gemini/text-embedding-004"
     else:
         LLM_MODEL = "gpt-4.1"
         EMBEDDING_MODEL = "text-embedding-3-large"
+    
+    tokenizer = AutoTokenizer.from_pretrained("colbert-ir/colbertv2.0")
+    model = AutoModel.from_pretrained("colbert-ir/colbertv2.0")
 
 
 async def llm_model_func(
@@ -36,9 +42,9 @@ async def llm_model_func(
     # Finally, add the new user prompt
     combined_prompt += f"user: {prompt}"
 
-    max_retries = 3
+    attempt = 1
 
-    for attempt in range(max_retries + 1):  # +1 for the initial attempt
+    while True:
         try:
             # Call the model
             response = completion(
@@ -54,22 +60,18 @@ async def llm_model_func(
             last_exception = e
             
             # Log the error
-            logging.warning(f"LLM API call failed (attempt {attempt + 1}/{max_retries + 1}): {str(e)}")
-            
-            # If this was the last attempt, raise the exception
-            if attempt == max_retries:
-                logging.error(f"All {max_retries + 1} attempts failed. Last error: {str(e)}")
-                raise e
-            
-            await asyncio.sleep(3)
+            logging.warning(f"LLM API call failed (attempt {attempt}): {str(e)}")
+             
+            attempt += 1
+            await asyncio.sleep(3 * attempt)
             
     raise last_exception
 
 
-async def embedding_func(texts):
-    max_retries = 3
+async def llm_embedding_func(texts):
+    attempt = 1
 
-    for attempt in range(max_retries + 1):  
+    while True:  
         try:
             response = embedding(
                 model=f"{Config.EMBEDDING_MODEL}",
@@ -81,16 +83,18 @@ async def embedding_func(texts):
             last_exception = e
                 
             # Log the error
-            logging.warning(f"LLM API call failed (attempt {attempt + 1}/{max_retries + 1}): {str(e)}")
-            
-            # If this was the last attempt, raise the exception
-            if attempt == max_retries:
-                logging.error(f"All {max_retries + 1} attempts failed. Last error: {str(e)}")
-                raise e
+            logging.warning(f"LLM API call failed (attempt {attempt}): {str(e)}")
+            attempt += 1
             
             await asyncio.sleep(3)
             
     raise last_exception
+
+async def colbert_embedding_func(texts):
+    inputs = Config.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+    with torch.no_grad():
+        embeddings = Config.model(**inputs).last_hidden_state.numpy()
+    return embeddings
 
 
 
@@ -104,9 +108,9 @@ async def initialize_rag(working_dir, vector_storage="NanoVectorDBStorage", debu
         vector_storage=vector_storage,
         llm_model_func=llm_model_func,
         embedding_func=EmbeddingFunc(
-            embedding_dim=768,
+            embedding_dim=20480 if vector_storage == "MuveraNanoVectorDBStorage" else 768,
             max_token_size=8192,
-            func=embedding_func,
+            func=colbert_embedding_func if vector_storage == "MuveraNanoVectorDBStorage" else llm_embedding_func,
         ),
         embedding_batch_num=16,
         embedding_func_max_async=1,

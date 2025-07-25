@@ -26,7 +26,7 @@ def insert_text(rag, file_path):
 def main():
     # Initialize RAG instance
     load_dotenv()
-    cls = "small_agri"
+    cls = "agri3"
     WORKING_DIR = f"storage/{cls}"
 
     if not os.path.exists(WORKING_DIR):

@@ -1,10 +1,23 @@
+import json
+import os
+import time
 import asyncio
 import re
-import json
+import traceback
+from dotenv import load_dotenv
+import litellm
+
 from lightrag import QueryParam
-from lightrag.utils import always_get_an_event_loop
+from lightrag.lightrag import LightRAG
+from lightrag.utils import always_get_an_event_loop, setup_logger
 
 from utils import initialize_rag
+
+def insert_text(rag: LightRAG, file_path):
+    with open(file_path, mode="r") as f:
+        unique_contexts = json.load(f)
+
+    rag.insert(unique_contexts)
 
 
 def extract_queries(file_path):
@@ -18,12 +31,12 @@ def extract_queries(file_path):
 
     return queries
 
-
-async def process_query(query_text, rag_instance, query_param):
+async def process_query(query_text, rag_instance: LightRAG, query_param):
     try:
         result = await rag_instance.aquery(query_text, param=query_param)
         return {"query": query_text, "result": result}, None
     except Exception as e:
+        traceback.print_exc()
         return None, {"query": query_text, "error": str(e)}
 
 
@@ -54,16 +67,25 @@ def run_queries_and_save_to_json(
 
         result_file.write("\n]")
 
+    
+def main():
+    load_dotenv()
 
-if __name__ == "__main__":
     cls = "agri3"
-    mode = "hybrid"
-    WORKING_DIR = f"storage/{cls}"
+    mode = "late-interaction"
 
-    rag = asyncio.run(initialize_rag(WORKING_DIR))
     query_param = QueryParam(mode=mode)
+    debug = True
 
+    if debug:
+        setup_logger(f"{mode}_{cls}", level="DEBUG", log_file_path=f"storage/muvera_{cls}/{mode}_{cls}.log")
+    rag = asyncio.run(initialize_rag(f"storage/muvera_{cls}", "MuveraNanoVectorDBStorage", debug=debug))
+    # insert_text(rag, f"UltraDomain/{cls}_unique_contexts.json")
     queries = extract_queries(f"UltraDomain/{cls}_questions.txt")
     run_queries_and_save_to_json(
-        queries, rag, query_param, f"results/{cls}_result.json", f"results/{cls}_errors.json"
+        queries, rag, query_param, f"results/muvera_{cls}_result.json", f"results/muvera_{cls}_errors.json"
     )
+
+
+if __name__ == "__main__":
+    main()

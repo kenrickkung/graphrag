@@ -31,6 +31,10 @@ class ColbertVectorDBStorage(BaseVectorStorage):
         self._storage_lock = None
         self.storage_updated = None
 
+        # Document Queue
+        self._documents_to_add = []
+        self._metadatas_to_add = []
+
         # Use global config value if specified, otherwise use default
         kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
         cosine_threshold = kwargs.get("cosine_better_than_threshold")
@@ -89,52 +93,26 @@ class ColbertVectorDBStorage(BaseVectorStorage):
         current_time = int(time.time())
         
         # Prepare documents and metadata for upsertion
-        documents = []
-        metadatas = []
-        ids = []
 
-        for doc_id, doc_data in data.items():
-            content = doc_data.get("content")
-            if content is None:
-                logger.warning(f"Content not found for ID {doc_id}, skipping.")
-                continue
-
-            documents.append(content)
-            
-            # Prepare metadata
-            metadata = {
-                "__id__": doc_id,
+        metadatas = [
+            {
+                "__id__": k,
                 "__created_at__": current_time,
-                **{k: v for k, v in doc_data.items() if k in self.meta_fields and k != "content"}
+                **{k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields},
             }
-            metadatas.append(metadata)
-            ids.append(doc_id)
+            for k, v in data.items()
+        ]
+        documents = [v["content"] for v in data.values()]
+        
 
         if not documents:
             logger.warning("No valid documents to upsert.")
             return
         
-            
-        # RAGatouille's index method
-        if not os.path.exists(self._index_path):
-            # Create new index
-            self.client.index(
-                collection=documents,
-                document_ids=ids,
-                document_metadatas=metadatas,
-                index_name=self._index_name,
-                max_document_length=512,
-            )
-        else:
-            # Add to existing index
-            self.client.add_to_index(
-                new_collection=documents,
-                new_document_ids=ids,
-                new_document_metadatas=metadatas,
-                index_name=self._index_name,
-            )
+        self._documents_to_add.extend(documents)
+        self._metadatas_to_add.extend(metadatas)
         
-        logger.debug(f"Upserted {len(documents)} documents to {self.namespace}")
+        logger.debug(f"Queued {len(documents)} documents for upsertion to {self.namespace}")
 
     async def query(
         self, query: str, top_k: int, ids: list[str] | None = None
@@ -152,9 +130,9 @@ class ColbertVectorDBStorage(BaseVectorStorage):
         formatted_results = []
         for result in results:
             formatted_result = {
-                "id": result.get("document_id", result.get("id")),
+                "id": result.get("document_metadata", result.get("__id__")),
                 "content": result.get("content", result.get("document")),
-                "distance": result.get("score", 0.0),  # RAGatouille uses 'score'
+                "distance": result.get("score", 0.0),
                 "created_at": result.get("document_metadata", {}).get("__created_at__"),
             }
             
@@ -199,14 +177,36 @@ class ColbertVectorDBStorage(BaseVectorStorage):
             f"RAGatouille doesn't support direct deletion. "
             f"Relations for entity {entity_name} deletion logged but not executed."
         )
+    async def _update_index(self):
+        """Update the index"""
+        if not os.path.exists(self._index_path):
+            # Create new index
+            self.client.index(
+                collection=self._documents_to_add,
+                document_metadatas=self._metadatas_to_add,
+                index_name=self._index_name,
+                max_document_length=512,
+            )
+        else:
+            # Add to existing index
+            self.client.add_to_index(
+                new_collection=self._documents_to_add,
+                new_document_metadatas=self._metadatas_to_add,
+                index_name=self._index_name,
+            )
+        
+        # Clear the queue
+        self._documents_to_add = []
+        self._metadatas_to_add = []
+        self._ids_to_add = []
 
     async def index_done_callback(self) -> bool:
         """Save/persist the index"""
         async with self._storage_lock:
             try:
-                # RAGatouille automatically persists indexes to disk
-                # The index is already saved when created/updated
-                
+                if len(self._documents_to_add) > 0:
+                    await self._update_index()
+
                 # Notify other processes that data has been updated
                 await set_all_update_flags(self.namespace)
                 # Reset own update flag to avoid self-reloading
