@@ -1962,7 +1962,7 @@ async def _build_query_context(
         )
 
         # Get vector chunks first if in mix mode
-        if query_param.mode == "mix" and chunks_vdb:
+        if query_param.mode in ["mix", "late-interaction"] and chunks_vdb:
             vector_chunks = await _get_vector_context(
                 query,
                 chunks_vdb,

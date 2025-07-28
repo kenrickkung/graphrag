@@ -58,12 +58,12 @@ def run_queries_and_save_to_json(
 if __name__ == "__main__":
     cls = "agri3"
     mode = "hybrid"
-    WORKING_DIR = f"storage/{cls}"
+    WORKING_DIR = f"storage/{cls}_2.0"
 
     rag = asyncio.run(initialize_rag(WORKING_DIR))
     query_param = QueryParam(mode=mode)
 
     queries = extract_queries(f"UltraDomain/{cls}_questions.txt")
     run_queries_and_save_to_json(
-        queries, rag, query_param, f"results/{cls}_result.json", f"results/{cls}_errors.json"
+        queries, rag, query_param, f"results/{cls}_result_2.0.json", f"results/{cls}_errors_2.0.json"
     )

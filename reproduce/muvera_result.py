@@ -75,7 +75,7 @@ def main():
     mode = "late-interaction"
 
     query_param = QueryParam(mode=mode)
-    debug = True
+    debug = False
 
     if debug:
         setup_logger(f"{mode}_{cls}", level="DEBUG", log_file_path=f"storage/muvera_{cls}/{mode}_{cls}.log")

@@ -94,8 +94,13 @@ def test_with_sample_data(rag: LightRAG):
         
         for query in queries:
             print(f"\nQuery: {query}")
-            result = rag.query(query, param=QueryParam(mode="late-interaction"))
+            result = rag.query(query, param=QueryParam(mode="late-interaction", only_need_context=True))
             print(f"Result: {result}")
+            with open("test.txt", "a") as f:
+                f.write(f"Query: {query}\n")
+                f.write(f"Result: {result}\n")
+            
+
     
         
     except Exception as e:
@@ -107,7 +112,7 @@ if __name__ == "__main__":
     load_dotenv()
     rag = asyncio.run(initialize_rag(
         working_dir="test",
-        vector_storage="MuveraNanoVectorDBStorage",
+        vector_storage="ColbertVectorDBStorage",
         debug=False
     ))
     test_with_sample_data(rag)

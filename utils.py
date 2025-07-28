@@ -13,8 +13,8 @@ import torch
 class Config:
     use_gemini = True
     if use_gemini:
-        LLM_MODEL = "gemini/gemini-2.5-pro"
-        # LLM_MODEL = "gemini/gemini-2.0-flash"
+        # LLM_MODEL = "gemini/gemini-2.5-pro"
+        LLM_MODEL = "gemini/gemini-2.0-flash"
         EMBEDDING_MODEL = "gemini/text-embedding-004"
     else:
         LLM_MODEL = "gpt-4.1"

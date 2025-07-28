@@ -27,7 +27,7 @@ def extract_queries(file_path):
 
     data = data.replace("**", "")
 
-    queries = re.findall(r"-   Question \d+: (.+)", data)
+    queries = re.findall(r"- Question \d+: (.+)", data)
 
     return queries
 
@@ -79,11 +79,11 @@ def main():
 
     if debug:
         setup_logger(f"{mode}_{cls}", level="DEBUG", log_file_path=f"storage/colbert_{cls}/{mode}_{cls}.log")
-    rag = asyncio.run(initialize_rag(f"storage/colbert_{cls}", "ColbertVectorDBStorage", debug=debug))
+    rag = asyncio.run(initialize_rag(f"storage/colbert_{cls}_2.0", "ColbertVectorDBStorage", debug=debug))
     insert_text(rag, f"UltraDomain/{cls}_unique_contexts.json")
     queries = extract_queries(f"UltraDomain/{cls}_questions.txt")
     run_queries_and_save_to_json(
-        queries, rag, query_param, f"results/colbert_{cls}_result.json", f"results/colbert_{cls}_errors.json"
+        queries, rag, query_param, f"results/colbert_{cls}_2.0_result.json", f"results/colbert_{cls}_2.0_errors.json"
     )
 
 

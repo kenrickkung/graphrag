@@ -27,7 +27,7 @@ def main():
     # Initialize RAG instance
     load_dotenv()
     cls = "agri3"
-    WORKING_DIR = f"storage/{cls}"
+    WORKING_DIR = f"storage/{cls}_2.0"
 
     if not os.path.exists(WORKING_DIR):
         os.mkdir(WORKING_DIR)
