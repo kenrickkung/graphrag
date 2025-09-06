@@ -81,7 +81,8 @@ def main():
         setup_logger(f"{mode}_{cls}", level="DEBUG", log_file_path=f"storage/muvera_{cls}/{mode}_{cls}.log")
     rag = asyncio.run(initialize_rag(f"storage/muvera_{cls}", "MuveraNanoVectorDBStorage", debug=debug))
     insert_text(rag, f"UltraDomain/{cls}_unique_contexts.json")
-    queries = extract_queries(f"UltraDomain/{cls}_questions.txt")
+    queries = extract_queries(f"UltraDomain/{cls}_questions_500.txt")
+    
     run_queries_and_save_to_json(
         queries, rag, query_param, f"results/muvera_{cls}_result.json", f"results/muvera_{cls}_errors.json"
     )

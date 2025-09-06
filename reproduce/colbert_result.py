@@ -74,16 +74,16 @@ def main():
     cls = "agri3"
     mode = "late-interaction"
 
-    query_param = QueryParam(mode=mode)
+    query_param = QueryParam(mode=mode, only_need_context=True)
     debug = False
 
     if debug:
         setup_logger(f"{mode}_{cls}", level="DEBUG", log_file_path=f"storage/colbert_{cls}/{mode}_{cls}.log")
-    rag = asyncio.run(initialize_rag(f"storage/colbert_{cls}_2.0", "ColbertVectorDBStorage", debug=debug))
+    rag = asyncio.run(initialize_rag(f"storage/colbert_{cls}", "ColbertVectorDBStorage", debug=debug))
     insert_text(rag, f"UltraDomain/{cls}_unique_contexts.json")
-    queries = extract_queries(f"UltraDomain/{cls}_questions.txt")
+    queries = extract_queries(f"UltraDomain/{cls}_questions_500.txt")
     run_queries_and_save_to_json(
-        queries, rag, query_param, f"results/colbert_{cls}_2.0_result.json", f"results/colbert_{cls}_2.0_errors.json"
+        queries[:2], rag, query_param, f"contexts/colbert_{cls}_keyword_contexts.json", f"contexts/colbert_{cls}_errors.json"
     )
 
 

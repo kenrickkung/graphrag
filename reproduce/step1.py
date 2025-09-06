@@ -27,11 +27,11 @@ def main():
     # Initialize RAG instance
     load_dotenv()
     cls = "agri3"
-    WORKING_DIR = f"storage/{cls}_2.0"
+    WORKING_DIR = f"storage/{cls}_miniLM"
 
     if not os.path.exists(WORKING_DIR):
         os.mkdir(WORKING_DIR)
-    rag = asyncio.run(initialize_rag(WORKING_DIR))
+    rag = asyncio.run(initialize_rag(WORKING_DIR, local_embedding=True))
     insert_text(rag, f"UltraDomain/{cls}_unique_contexts.json")
 
 

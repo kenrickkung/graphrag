@@ -1586,7 +1586,8 @@ async def kg_query(
     if cached_response is not None:
         return cached_response
 
-    if query_param.mode == "late-interaction":
+    late_interaction_with_query = False
+    if query_param.mode == "late-interaction" and late_interaction_with_query:
         ll_keywords_str = query
         hl_keywords_str = query
     else:
@@ -1614,8 +1615,13 @@ async def kg_query(
             )
             query_param.mode = "local"
 
-        ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
-        hl_keywords_str = ", ".join(hl_keywords) if hl_keywords else ""
+        query_and_keywords = False
+        if query_and_keywords:
+            ll_keywords_str = ", ".join(ll_keywords) + " " + query if ll_keywords else query
+            hl_keywords_str = ", ".join(hl_keywords) + " " + query if hl_keywords else query
+        else:
+            ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
+            hl_keywords_str = ", ".join(hl_keywords) if hl_keywords else ""
 
     # Build context
     context = await _build_query_context(

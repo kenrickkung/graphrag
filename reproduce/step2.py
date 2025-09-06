@@ -1,4 +1,5 @@
 import json
+import os
 from litellm import completion
 from transformers import GPT2Tokenizer
 from dotenv import load_dotenv
@@ -21,13 +22,14 @@ def get_summary(context, tot_tokens=2000):
     return summary
 
 load_dotenv()
+os.environ["LITELLM_LOG"] = "INFO"
 clses = ["agri3"]
 for cls in clses:
     with open(f"UltraDomain/{cls}_unique_contexts.json", mode="r") as f:
         unique_contexts = json.load(f)
 
     summaries = [get_summary(context) for context in unique_contexts]
-
+    
     total_description = "\n\n".join(summaries)
 
     prompt = f"""
@@ -35,7 +37,7 @@ for cls in clses:
 
     {total_description}
 
-    Please identify 5 potential users who would engage with this dataset. For each user, list 5 tasks they would perform with this dataset. Then, for each (user, task) combination, generate 5 questions that require a high-level understanding of the entire dataset.
+    Please identify 10 potential users who would engage with this dataset. For each user, list 10 tasks they would perform with this dataset. Then, for each (user, task) combination, generate 5 questions that require a high-level understanding of the entire dataset.
 
     Output the results in the following structure:
     - User 1: [user description]
@@ -47,18 +49,21 @@ for cls in clses:
             - Question 5:
         - Task 2: [task description]
             ...
-        - Task 5: [task description]
+        - Task 10: [task description]
     - User 2: [user description]
         ...
-    - User 5: [user description]
+    - User 10: [user description]
         ...
     """
+
+    print(prompt)
     response = completion(
         model=MODEL, 
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
+        request_timeout=300
     )
-
-    file_path = f"UltraDomain/{cls}_questions.txt"
+    print(response)
+    file_path = f"UltraDomain/{cls}_questions_500.txt"
     with open(file_path, "w") as file:
         file.write(response.choices[0].message.content)
 

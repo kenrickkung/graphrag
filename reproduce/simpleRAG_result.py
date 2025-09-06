@@ -1,16 +1,11 @@
-import os
+import asyncio
 import re
 import json
+from lightrag import QueryParam
+from lightrag.utils import always_get_an_event_loop
 
-from dotenv import load_dotenv
-from reproduce.simpleRAG import SimpleRAG
+from utils import initialize_rag
 
-
-def insert_text(rag, file_path):
-    with open(file_path, mode="r") as f:
-        unique_contexts = json.load(f)
-        
-    rag.insert(unique_contexts)
 
 def extract_queries(file_path):
     with open(file_path, "r") as f:
@@ -24,17 +19,18 @@ def extract_queries(file_path):
     return queries
 
 
-def process_query(query_text, rag_instance):
+async def process_query(query_text, rag_instance, query_param):
     try:
-        result = rag_instance.query(query_text)
+        result = await rag_instance.aquery(query_text, param=query_param)
         return {"query": query_text, "result": result}, None
     except Exception as e:
         return None, {"query": query_text, "error": str(e)}
 
 
 def run_queries_and_save_to_json(
-    queries, rag_instance, output_file, error_file
+    queries, rag_instance, query_param, output_file, error_file
 ):
+    loop = always_get_an_event_loop()
 
     with open(output_file, "a", encoding="utf-8") as result_file, open(
         error_file, "a", encoding="utf-8"
@@ -43,8 +39,10 @@ def run_queries_and_save_to_json(
         first_entry = True
 
         for query_text in queries:
-            result, error = process_query(query_text, rag_instance,)
-            
+            result, error = loop.run_until_complete(
+                process_query(query_text, rag_instance, query_param)
+            )
+
             if result:
                 if not first_entry:
                     result_file.write(",\n")
@@ -58,18 +56,14 @@ def run_queries_and_save_to_json(
 
 
 if __name__ == "__main__":
-    load_dotenv()
-
     cls = "agri3"
+    mode = "naive"
+    WORKING_DIR = f"storage/{cls}"
 
-    rag = SimpleRAG(
-        f"storage/SimpleRAG_{cls}",
-        model="gemini/gemini-2.5-pro",
-        embedding_model="gemini/text-embedding-004",
-        debug=True
-    )
-    insert_text(rag, f"UltraDomain/{cls}_unique_contexts.json")
-    queries = extract_queries(f"UltraDomain/{cls}_questions.txt")
+    rag = asyncio.run(initialize_rag(WORKING_DIR, local_embedding=False))
+    query_param = QueryParam(mode=mode)
+
+    queries = extract_queries(f"UltraDomain/{cls}_questions_500.txt")
     run_queries_and_save_to_json(
-        queries, rag, f"results/{cls}_result_simplerag.json", f"results/{cls}_errors_simplerag.json"
+        queries, rag, query_param, f"results/naive_{cls}_result.json", f"results/naive_{cls}_errors.json"
     )
